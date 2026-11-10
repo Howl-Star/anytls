@@ -268,14 +268,36 @@ ACME_BIN="${ACME_HOME}/acme.sh"
 install_acme() {
   [ -x "$ACME_BIN" ] && return 0
   info "安装 acme.sh..."
+  mkdir -p "$ACME_HOME"
   local email_arg=''
   [ -n "$EMAIL" ] && email_arg="email=${EMAIL}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --max-time 60 https://get.acme.sh | sh -s $email_arg >/dev/null 2>&1 || true
-  else
-    wget -qO- --timeout=60 https://get.acme.sh | sh -s $email_arg >/dev/null 2>&1 || true
+  local installer="${ACME_HOME}/get.sh"
+
+  # 方式一：官方安装器（保留输出，失败原因可见）
+  fetch https://get.acme.sh "$installer" || true
+  if [ -s "$installer" ]; then
+    sh "$installer" $email_arg || true
   fi
-  [ -x "$ACME_BIN" ] || error "acme.sh 安装失败，请检查网络"
+
+  # 方式二：直接下载 acme.sh 单文件后本地 install（不再二次联网）
+  if [ ! -x "$ACME_BIN" ]; then
+    warn "官方安装器未成功，改用直接下载 acme.sh"
+    fetch "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" "$ACME_BIN" || true
+    if [ -s "$ACME_BIN" ]; then
+      chmod +x "$ACME_BIN"
+      "$ACME_BIN" --install --home "$ACME_HOME" >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -f "$installer"
+
+  if [ ! -x "$ACME_BIN" ]; then
+    error "acme.sh 安装失败：无法访问 get.acme.sh 或 GitHub
+ 请先手动确认出网：curl -I https://raw.githubusercontent.com
+ 或手动安装后重跑本脚本：
+  mkdir -p ~/.acme.sh
+  curl -L https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o ~/.acme.sh/acme.sh
+  chmod +x ~/.acme.sh/acme.sh"
+  fi
   "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 }
 
