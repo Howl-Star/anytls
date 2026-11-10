@@ -1,0 +1,5 @@
+# 统一使用 LF：.sh 带 CRLF 会让 Linux 报 "bad interpreter: /usr/bin/env: 'bash\r'"
+* text=auto eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+LICENSE text eol=lf
