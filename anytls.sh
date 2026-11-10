@@ -142,10 +142,31 @@ detect_arch() {
 }
 
 # ==================== 依赖 ====================
+# acme.sh 安装器要求系统已有 crontab，否则直接判 Install error 退出
+install_cron() {
+  command -v crontab >/dev/null 2>&1 && return 0
+  pkg_update
+  case "$PKG_FAMILY" in
+    deb)    pkg_install cron ;;
+    rpm)    pkg_install cronie ;;
+    apk)    pkg_install dcron ;;
+    pacman) pkg_install cronie ;;
+    zypper) pkg_install cron ;;
+    *)      return 1 ;;
+  esac
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+  elif command -v rc-update >/dev/null 2>&1; then
+    rc-update add crond default >/dev/null 2>&1 || true
+    rc-service crond start >/dev/null 2>&1 || true
+  fi
+  command -v crontab >/dev/null 2>&1
+}
+
 check_deps() {
   local need=() c
   if [ "$PKG_FAMILY" = 'unknown' ]; then
-    warn "未能识别系统包管理器，请手动确保已安装：curl tar openssl socat ca-certificates"
+    warn "未能识别系统包管理器，请手动确保已安装：curl tar openssl socat ca-certificates cron"
   else
     for c in curl tar openssl socat; do
       command -v "$c" >/dev/null 2>&1 || need+=("$c")
@@ -168,6 +189,11 @@ check_deps() {
   fi
 
   command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || error "缺少 curl / wget，无法继续"
+
+  # acme.sh 安装器强制要求 crontab，缺失会直接 Install error
+  if ! install_cron; then
+    warn "未能安装 cron，将使用 --force 跳过自动续期任务（需自行再次运行脚本 renew 续期）"
+  fi
 }
 
 # 统一的下载函数（优先 curl，回退 wget）
@@ -273,10 +299,17 @@ install_acme() {
   [ -n "$EMAIL" ] && email_arg="email=${EMAIL}"
   local installer="${ACME_HOME}/get.sh"
 
+  # acme.sh 安装器没有 crontab 会直接 Install error，必须先备好 cron 或用 --force
+  local force_arg=''
+  if ! command -v crontab >/dev/null 2>&1; then
+    warn "系统未安装 crontab，acme.sh 将以 --force 方式安装（不注册自动续期任务）"
+    force_arg='--force'
+  fi
+
   # 方式一：官方安装器（保留输出，失败原因可见）
   fetch https://get.acme.sh "$installer" || true
   if [ -s "$installer" ]; then
-    sh "$installer" $email_arg || true
+    sh "$installer" $email_arg $force_arg || true
   fi
 
   # 方式二：直接下载 acme.sh 单文件后本地 install（不再二次联网）
@@ -285,7 +318,7 @@ install_acme() {
     fetch "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" "$ACME_BIN" || true
     if [ -s "$ACME_BIN" ]; then
       chmod +x "$ACME_BIN"
-      "$ACME_BIN" --install --home "$ACME_HOME" >/dev/null 2>&1 || true
+      "$ACME_BIN" --install --home "$ACME_HOME" $force_arg >/dev/null 2>&1 || true
     fi
   fi
   rm -f "$installer"
