@@ -5,13 +5,13 @@
 ## 一键安装
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/anytls.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh)
 ```
 
 装好后随时输入下面的命令打开管理菜单：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/<你的用户名>/<仓库名>/main/anytls.sh) menu
+bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh) menu
 ```
 
 > 已安装后也可以只用本地副本：`bash anytls.sh menu`
