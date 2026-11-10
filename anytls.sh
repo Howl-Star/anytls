@@ -366,10 +366,14 @@ issue_cert() {
 install_cert() {
   local domain="$1"
   mkdir -p "$CERT_DIR"
+  # acme.sh 的 --install-cert 会立即执行 reloadcmd；此时服务可能尚未创建
+  # （首次安装场景），因此 reloadcmd 必须自带容错，否则会误判为“证书安装失败”。
   "$ACME_BIN" --install-cert -d "$domain" --ecc \
     --key-file "$KEY_FILE" \
     --fullchain-file "$CERT_FILE" \
-    --reloadcmd "$(reload_cmd)" || error "证书安装失败"
+    --reloadcmd "$(reload_cmd)" || true
+
+  [ -s "$KEY_FILE" ] && [ -s "$CERT_FILE" ] || error "证书安装失败：${CERT_FILE} 或 ${KEY_FILE} 为空"
 
   chmod 600 "$KEY_FILE"
   chmod 644 "$CERT_FILE"
@@ -377,11 +381,13 @@ install_cert() {
 }
 
 # 续期时用于重载服务的命令（写入 acme.sh 的 reloadcmd）
+# 末尾的 || true 是必需的：acme.sh 在 --install-cert 阶段就会执行该命令，
+# 首次安装时 anytls.service 还不存在，不能因此中断安装流程。
 reload_cmd() {
   if [ "$INIT" = 'systemd' ]; then
-    printf 'systemctl restart %s' "$SERVICE_NAME"
+    printf 'systemctl restart %s >/dev/null 2>&1 || true' "$SERVICE_NAME"
   else
-    printf 'rc-service %s restart' "$SERVICE_NAME"
+    printf 'rc-service %s restart >/dev/null 2>&1 || true' "$SERVICE_NAME"
   fi
 }
 
