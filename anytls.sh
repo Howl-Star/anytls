@@ -10,7 +10,7 @@
 #   bash anytls.sh info | status | restart | update | renew | uninstall | menu | help
 #
 # 远程一键安装：
-#   bash <(curl -Ls https://raw.githubusercontent.com/<用户名>/<仓库>/main/anytls.sh)
+#   bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh)
 
 set -o pipefail
 
@@ -36,7 +36,8 @@ RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[36m'; BOLD=$
 
 info()  { printf '%s\n' "${GREEN}${BOLD}$*${PLAIN}"; }
 warn()  { printf '%s\n' "${YELLOW}${BOLD}$*${PLAIN}"; }
-error() { printf '%s\n' "${RED}${BOLD}$*${PLAIN}"; exit 1; }
+# 多行错误信息用 %b 解析 \n（%s 会把 \n 原样打印出来）
+error() { printf '%b\n' "${RED}${BOLD}$*${PLAIN}"; exit 1; }
 line()  { printf '%s\n' "${BLUE}----------------------------------------------------------------${PLAIN}"; }
 
 # 交互读取：兼容 `curl | bash` 场景（stdin 是管道时改从终端读）
@@ -62,7 +63,8 @@ reading() {
 
 confirm() {
   local prompt="$1" answer
-  reading "${prompt} [y/N] " answer 'n'
+  # 默认值由 reading 负责追加，这里不要再写死 [n]，否则会显示成 "[y/N] [n]"
+  reading "${prompt} (y/N)" answer 'n'
   [[ "$answer" =~ ^[Yy]$ ]]
 }
 
@@ -260,6 +262,8 @@ install_core() {
     info "获取 sing-box 最新版本..."
     ver=$(get_latest_version)
   fi
+  # 归一化：允许 --version v1.14.4，否则会拼出 download/vv1.14.4/ 与 sing-box-v1.14.4-... 两个错地址
+  ver="${ver#v}"
   [ -n "$ver" ] || error "无法获取 sing-box 版本号，请检查网络后重试（也可手动指定：--version 1.12.0）"
 
   tmp=$(mktemp -d)
@@ -284,7 +288,10 @@ install_core() {
 }
 
 core_version() {
-  [ -x "$BIN_FILE" ] && "$BIN_FILE" version 2>/dev/null | awk '/^version/{print $NF}' | head -n1
+  # sing-box 的首行是 "sing-box version 1.14.4"，并非 "version 1.14.4"，
+  # 用 /^version/ 匹配会永远得到空字符串
+  [ -x "$BIN_FILE" ] || return 0
+  "$BIN_FILE" version 2>/dev/null | sed -n '1s/.* version \([0-9][^ ]*\).*/\1/p' | head -n1
 }
 
 # ==================== 证书（acme.sh） ====================
@@ -336,7 +343,7 @@ install_acme() {
 
 # issue_cert <domain> <webroot> ；webroot 为空时自动选择 standalone(80) / alpn(443)
 issue_cert() {
-  local domain="$1" webroot="$2" extra=''
+  local domain="$1" webroot="$2" extra='' stopped='0'
   [ -n "$domain" ] || error "缺少域名，无法申请证书"
 
   install_acme
@@ -353,11 +360,25 @@ issue_cert() {
   elif ! port_in_use 80; then
     info "验证方式：standalone（80 端口）"
     "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra
-  elif ! port_in_use 443; then
-    info "验证方式：TLS-ALPN（443 端口）"
-    "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra
   else
-    error "80 与 443 端口均被占用，无法完成 ACME 验证。\n请释放端口，或使用 --webroot /var/www/html 指定站点根目录"
+    # 80 已被占用，退到 TLS-ALPN(443)。若 443 正是本服务在监听（续期时的常见情况），
+    # 必须先停服务，否则 acme.sh 绑不上 443，验证必然失败。
+    if svc_active; then
+      warn "443 端口由 AnyTLS 自身监听，临时停止服务以完成 TLS-ALPN 验证"
+      svc_stop
+      stopped='1'
+      sleep 1
+    fi
+    if port_in_use 443; then
+      [ "$stopped" = '1' ] && svc_start
+      error "80 与 443 端口均被占用，无法完成 ACME 验证。\n请释放端口，或使用 --webroot /var/www/html 指定站点根目录"
+    fi
+    info "验证方式：TLS-ALPN（443 端口）"
+    if ! "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra; then
+      [ "$stopped" = '1' ] && svc_start
+      error "TLS-ALPN 验证失败，请确认 443 可被外网访问、域名已解析到本机"
+    fi
+    [ "$stopped" = '1' ] && svc_start
   fi
 
   install_cert "$domain"
@@ -554,7 +575,8 @@ valid_domain() {
 }
 
 valid_port() {
-  printf '%s' "$1" | grep -Eq '^[0-9]{1,5}$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+  # 拒绝前导零：JSON 数字不允许 08443 这种写法，否则 sing-box 解析配置直接失败
+  printf '%s' "$1" | grep -Eq '^(0|[1-9][0-9]{0,4})$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
 valid_password() {
@@ -600,14 +622,19 @@ build_links() {
 
   enc_name=$(url_encode "${NODE_NAME}")
 
+  # YAML 双引号字符串里 " 和 \ 必须转义，否则节点名带引号会让配置整体非法
+  yaml_name=${NODE_NAME//\\/\\\\}
+  yaml_name=${yaml_name//\"/\\\"}
+
   # 参数对齐 fscarmen/sing-box 的实现：anytls 专有字段 + 标准 tls 字段
   uri="anytls://${PASSWORD}@${server}:${PORT}?idle_session_check_interval=30s&idle_session_timeout=30s&min_idle_session=5&security=tls&sni=${DOMAIN}&fp=${DEFAULT_FP}#${enc_name}"
 
-  clash_link="- name: \"${NODE_NAME}\"
+  # password 加引号：纯数字密码不加引号会被 YAML 解析成整数，mihomo 期望字符串
+  clash_link="- name: \"${yaml_name}\"
   type: anytls
   server: ${server}
   port: ${PORT}
-  password: ${PASSWORD}
+  password: \"${PASSWORD}\"
   client-fingerprint: ${DEFAULT_FP}
   sni: ${DOMAIN}
   udp: true
@@ -702,7 +729,7 @@ do_install() {
   resolved=$(resolve_domain "$DOMAIN")
   if [ -z "$resolved" ]; then
     warn "域名 ${DOMAIN} 暂无解析记录，ACME 验证可能失败"
-  elif [ -n "$SERVER_IP" ] && ! printf '%s' "$resolved" | grep -q "$SERVER_IP"; then
+  elif [ -n "$SERVER_IP" ] && ! printf '%s\n' "$resolved" | tr ' ' '\n' | grep -qxF "$SERVER_IP"; then
     warn "域名 ${DOMAIN} 解析到：${resolved}，本机公网 IP：${SERVER_IP}"
     confirm "解析似乎不一致，仍要继续？" || { info "已取消"; exit 0; }
   fi
@@ -964,7 +991,7 @@ AnyTLS 一键安装与管理脚本（sing-box 内核 + acme.sh 证书）
   bash anytls.sh install --domain tls.example.com --webroot /var/www/html
 
 远程一键安装:
-  bash <(curl -Ls https://raw.githubusercontent.com/<用户名>/<仓库>/main/anytls.sh)
+  bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh)
 EOF
 }
 
