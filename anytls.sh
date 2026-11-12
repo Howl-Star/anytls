@@ -136,9 +136,17 @@ detect_arch() {
     x86_64|amd64)   ARCH="amd64${musl}" ;;
     aarch64|arm64)  ARCH="arm64${musl}" ;;
     armv7l|armv7)   ARCH="armv7${musl}" ;;
-    armv6l)         ARCH="armv6${musl}" ;;
+    armv6l)
+      # sing-box 只提供 armv6 的 glibc 版，没有 armv6-musl 资产
+      [ -n "$musl" ] && error "sing-box 未提供 armv6 的 musl 版本，Alpine 等 musl 系统请改用 armv7 或 glibc 发行版"
+      ARCH="armv6"
+      ;;
     i386|i686)      ARCH="386${musl}" ;;
-    s390x)          ARCH="s390x${musl}" ;;
+    s390x)
+      # 同上：s390x 只有 glibc 版
+      [ -n "$musl" ] && error "sing-box 未提供 s390x 的 musl 版本，请改用 glibc 发行版"
+      ARCH="s390x"
+      ;;
     *)              error "不支持的 CPU 架构：$(uname -m)" ;;
   esac
 }
@@ -257,7 +265,7 @@ get_latest_version() {
 }
 
 install_core() {
-  local ver="${1:-}" tmp url dir
+  local ver="${1:-}" tmp url dir bak="${BIN_FILE}.bak"
   if [ -z "$ver" ]; then
     info "获取 sing-box 最新版本..."
     ver=$(get_latest_version)
@@ -278,11 +286,23 @@ install_core() {
   [ -n "$dir" ] || { rm -rf "$tmp"; error "压缩包内未找到 sing-box 可执行文件"; }
 
   mkdir -p "$WORK_DIR"
+  # 先备份旧内核：替换后若新内核跑不起来，还能回滚，不至于把服务搞成「更新完就起不来」
+  rm -f "$bak"
+  [ -x "$BIN_FILE" ] && cp -f "$BIN_FILE" "$bak" 2>/dev/null || true
   # 先装到同目录的临时文件名，再 mv 原子替换：
   # 直接覆盖/删除正在运行的二进制会 ETXTBSY，mv 只替换目录项，运行中的进程持有旧 inode
   install -m 0755 "$dir" "${BIN_FILE}.new" || { rm -rf "$tmp"; error "安装内核失败"; }
   mv -f "${BIN_FILE}.new" "$BIN_FILE" || { rm -rf "$tmp"; error "替换内核失败"; }
   rm -rf "$tmp"
+  # 自检：下载到的是不是能给本机跑的可执行文件（架构不符/文件损坏都会在这里暴露）
+  if ! "$BIN_FILE" version >/dev/null 2>&1; then
+    if [ -s "$bak" ]; then
+      mv -f "$bak" "$BIN_FILE"
+      error "新内核无法在本机运行（架构不匹配或文件损坏），已回滚到旧版本"
+    fi
+    error "新内核无法在本机运行（架构不匹配或文件损坏）"
+  fi
+  rm -f "$bak"
   printf '%s' "$ver" > "${WORK_DIR}/version"
   info "内核安装完成：v${ver}"
 }
@@ -356,10 +376,22 @@ issue_cert() {
   if [ -n "$webroot" ]; then
     [ -d "$webroot" ] || error "webroot 目录不存在：$webroot"
     info "验证方式：webroot（${webroot}）"
-    "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra
+    # 必须检查返回值：acme.sh 签发失败时返回非 0，
+    # 若继续往下走 install_cert，机器上残留的旧证书会让"文件非空"判据误判为成功
+    if ! "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra; then
+      error "webroot 方式验证失败。请确认：
+  1) http://${domain}/.well-known/acme-challenge/ 能被外网访问（80/TCP 已放行）
+  2) ${webroot} 是 Web 站点的根目录（如 /var/www/html），且 Nginx/Apache 已运行"
+    fi
   elif ! port_in_use 80; then
     info "验证方式：standalone（80 端口）"
-    "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra
+    if ! "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra; then
+      error "standalone 验证失败。请确认：
+  1) 云厂商安全组与系统防火墙均已放行 80/TCP
+  2) 域名 ${domain} 已解析到本机公网 IP
+  3) 80 端口没有其它程序占用
+若 80 端口不便开放，可改用 --webroot /var/www/html（需已有 Web 服务）"
+    fi
   else
     # 80 已被占用，退到 TLS-ALPN(443)。若 443 正是本服务在监听（续期时的常见情况），
     # 必须先停服务，否则 acme.sh 绑不上 443，验证必然失败。
@@ -415,6 +447,10 @@ reload_cmd() {
 # ==================== 配置文件 ====================
 write_config() {
   mkdir -p "$WORK_DIR"
+  # listen 选择：有 IPv6 时用 "::"（Linux 下默认 dual-stack，同时收 IPv4/IPv6），
+  # 内核禁用了 IPv6（ipv6.disable=1）时 "::" 会绑定失败导致服务起不来，改用 0.0.0.0
+  local listen_addr='::'
+  [ -f /proc/net/if_inet6 ] || listen_addr='0.0.0.0'
   # 密码由 valid_password 约束为 [A-Za-z0-9._~-]，不含引号与反斜杠，可安全直接嵌入
   cat > "$CONF_FILE" <<EOF
 {
@@ -426,7 +462,7 @@ write_config() {
     {
       "type": "anytls",
       "tag": "anytls-in",
-      "listen": "::",
+      "listen": "${listen_addr}",
       "listen_port": ${PORT},
       "users": [
         {
@@ -595,12 +631,14 @@ gen_password() {
 
 # ==================== 节点信息输出 ====================
 url_encode() {
-  local s="$1" out='' c i
+  # 必须强制 C locale 按字节处理：Linux 上通常是 C.UTF-8，此时 ${#s} 是字符数、
+  # ${s:i:1} 取的是整个多字节字符，printf '%02X' "'香" 只会得到末字节 0x99，
+  # 中文节点名会被编码成 %9999 之类的垃圾
+  local LC_ALL=C s="$1" out='' c i
   for ((i = 0; i < ${#s}; i++)); do
     c="${s:i:1}"
     case "$c" in
       [a-zA-Z0-9.~_-]) out+="$c" ;;
-      ' ') out+='%20' ;;
       *) out+=$(printf '%%%02X' "'$c") ;;
     esac
   done
@@ -1003,6 +1041,10 @@ FORCE_INSTALL='0'; FORCE_RENEW='0'; SERVER_IP=''
 # 取选项值：缺值时报错，避免 `--domain` 结尾把下一个参数吞掉或变成死循环
 need_value() {
   [ "$2" -ge 2 ] || error "选项 $1 缺少取值（bash $0 help 查看用法）"
+  # 下一个参数若是另一个选项，说明本选项漏了取值（如 --domain --port 443）
+  case "$3" in
+    -*) error "选项 $1 缺少取值，其后直接跟了选项 $3（bash $0 help 查看用法）" ;;
+  esac
 }
 
 while [ $# -gt 0 ]; do
@@ -1011,13 +1053,13 @@ while [ $# -gt 0 ]; do
       ACTION="$1"
       shift
       ;;
-    --domain)   need_value "$1" $#; DOMAIN="$2"; shift 2 ;;
-    --port)     need_value "$1" $#; PORT="$2"; shift 2 ;;
-    --password) need_value "$1" $#; PASSWORD="$2"; shift 2 ;;
-    --name)     need_value "$1" $#; NODE_NAME="$2"; shift 2 ;;
-    --email)    need_value "$1" $#; EMAIL="$2"; shift 2 ;;
-    --webroot)  need_value "$1" $#; WEBROOT="$2"; shift 2 ;;
-    --version)  need_value "$1" $#; CORE_VERSION="$2"; shift 2 ;;
+    --domain)   need_value "$1" $# "$2"; DOMAIN="$2"; shift 2 ;;
+    --port)     need_value "$1" $# "$2"; PORT="$2"; shift 2 ;;
+    --password) need_value "$1" $# "$2"; PASSWORD="$2"; shift 2 ;;
+    --name)     need_value "$1" $# "$2"; NODE_NAME="$2"; shift 2 ;;
+    --email)    need_value "$1" $# "$2"; EMAIL="$2"; shift 2 ;;
+    --webroot)  need_value "$1" $# "$2"; WEBROOT="$2"; shift 2 ;;
+    --version)  need_value "$1" $# "$2"; CORE_VERSION="$2"; shift 2 ;;
     --force)    FORCE_INSTALL='1'; shift ;;
     *)
       warn "未知参数：$1"

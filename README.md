@@ -18,7 +18,9 @@ bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.s
 
 ## 特性
 
-- **AnyTLS 协议**：sing-box 官方内核，自动识别 amd64 / arm64 / armv7 / 386 / s390x，Alpine 自动选 musl 版本
+- **AnyTLS 协议**：sing-box 官方内核，自动识别 amd64 / arm64 / armv7 / armv6 / 386 / s390x；musl 系统（Alpine）自动选 `-musl` 版本（armv6 / s390x 无 musl 资产，脚本会明确报错而不是 404）
+- **内核自检回滚**：替换内核后先跑 `sing-box version` 自检，架构不符或文件损坏时自动回滚到旧版本
+- **监听地址自适应**：有 IPv6 时监听 `::`（dual-stack），内核禁用 IPv6 时自动改用 `0.0.0.0`
 - **真证书**：域名 + Let's Encrypt（acme.sh），自动续期并通过 `--reloadcmd` 重启服务
 - **零依赖装**：自动识别 apt / dnf / yum / apk / pacman / zypper 安装 `curl tar openssl socat`
 - **服务管理**：systemd 与 OpenRC 双支持
@@ -124,6 +126,8 @@ Clash / mihomo：
 
 - 确认域名 A / AAAA 记录已生效：`dig +short tls.example.com`
 - 确认 80 或 443 未被占用；被占用时改用 `--webroot /var/www/html`
+- **云服务器要同时放行安全组和系统防火墙的 80/TCP**（standalone 验证必需）；AWS 安全组默认不放行 80，这是最常见的失败原因
+- 脚本在签发失败时会直接退出并给出对应提示，不会用旧证书「假装成功」
 - Let's Encrypt 有频率限制，失败后不要反复重试
 
 **服务起不来？**
