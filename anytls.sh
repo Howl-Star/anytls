@@ -361,59 +361,101 @@ install_acme() {
   "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 }
 
-# issue_cert <domain> <webroot> ；webroot 为空时自动选择 standalone(80) / alpn(443)
+# 单次 ACME 验证尝试；成功返回 0，失败返回非 0（由调用方决定是否换方式）
+_try_issue() {
+  local domain="$1" mode="$2" webroot="$3" extra="$4"
+  case "$mode" in
+    webroot)
+      "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra ;;
+    standalone)
+      "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra ;;
+    alpn)
+      "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra ;;
+  esac
+}
+
+# issue_cert <domain> <webroot> ；webroot 为空时按 standalone(80) -> TLS-ALPN(443) 依次尝试
 issue_cert() {
-  local domain="$1" webroot="$2" extra='' stopped='0'
+  local domain="$1" webroot="$2" extra='' stopped='0' m hinted=''
+  local -a modes=()
   [ -n "$domain" ] || error "缺少域名，无法申请证书"
 
   install_acme
 
-  # 已有帐篷记录时强制重签
+  # 已有证书记录时强制重签
   [ "$FORCE_RENEW" = '1' ] && extra='--force'
+
+  if [ -n "$webroot" ]; then
+    [ -d "$webroot" ] || error "webroot 目录不存在：$webroot"
+    modes=('webroot')
+  else
+    # 80 空闲才试 standalone，否则直接 ALPN。
+    # 关键：standalone 失败必须回退到 ALPN —— 很多云主机（如 AWS 安全组）只放行 443，
+    # 若失败即退出，用户永远装不上。
+    port_in_use 80 || modes+=('standalone')
+    modes+=('alpn')
+  fi
 
   line
   info "为 ${domain} 申请 Let's Encrypt 证书"
-  if [ -n "$webroot" ]; then
-    [ -d "$webroot" ] || error "webroot 目录不存在：$webroot"
-    info "验证方式：webroot（${webroot}）"
-    # 必须检查返回值：acme.sh 签发失败时返回非 0，
-    # 若继续往下走 install_cert，机器上残留的旧证书会让"文件非空"判据误判为成功
-    if ! "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra; then
-      error "webroot 方式验证失败。请确认：
+
+  for m in "${modes[@]}"; do
+    case "$m" in
+      webroot)
+        info "验证方式：webroot（${webroot}）"
+        if _try_issue "$domain" webroot "$webroot" "$extra"; then
+          install_cert "$domain"; return 0
+        fi
+        hinted="webroot 验证失败。请确认：
   1) http://${domain}/.well-known/acme-challenge/ 能被外网访问（80/TCP 已放行）
   2) ${webroot} 是 Web 站点的根目录（如 /var/www/html），且 Nginx/Apache 已运行"
-    fi
-  elif ! port_in_use 80; then
-    info "验证方式：standalone（80 端口）"
-    if ! "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra; then
-      error "standalone 验证失败。请确认：
-  1) 云厂商安全组与系统防火墙均已放行 80/TCP
-  2) 域名 ${domain} 已解析到本机公网 IP
-  3) 80 端口没有其它程序占用
-若 80 端口不便开放，可改用 --webroot /var/www/html（需已有 Web 服务）"
-    fi
-  else
-    # 80 已被占用，退到 TLS-ALPN(443)。若 443 正是本服务在监听（续期时的常见情况），
-    # 必须先停服务，否则 acme.sh 绑不上 443，验证必然失败。
-    if svc_active; then
-      warn "443 端口由 AnyTLS 自身监听，临时停止服务以完成 TLS-ALPN 验证"
-      svc_stop
-      stopped='1'
-      sleep 1
-    fi
-    if port_in_use 443; then
-      [ "$stopped" = '1' ] && svc_start
-      error "80 与 443 端口均被占用，无法完成 ACME 验证。\n请释放端口，或使用 --webroot /var/www/html 指定站点根目录"
-    fi
-    info "验证方式：TLS-ALPN（443 端口）"
-    if ! "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra; then
-      [ "$stopped" = '1' ] && svc_start
-      error "TLS-ALPN 验证失败，请确认 443 可被外网访问、域名已解析到本机"
-    fi
-    [ "$stopped" = '1' ] && svc_start
-  fi
+        ;;
+      standalone)
+        info "验证方式：standalone（80 端口）"
+        if _try_issue "$domain" standalone '' "$extra"; then
+          install_cert "$domain"; return 0
+        fi
+        hinted="standalone 验证失败。请确认云厂商安全组与系统防火墙均已放行 80/TCP，且域名 ${domain} 已解析到本机公网 IP"
+        warn "${hinted}；继续尝试 TLS-ALPN(443)"
+        ;;
+      alpn)
+        # 443 空闲则直接验证；被占用时先判断是不是本服务占的：
+        # 只有本服务在监听才值得停一次试试，否则停服务毫无意义（纯属无谓中断）
+        if port_in_use 443; then
+          if svc_active; then
+            warn "443 端口被占用，临时停止 AnyTLS 服务后重试 TLS-ALPN 验证"
+            svc_stop
+            stopped='1'
+            sleep 1
+            if port_in_use 443; then
+              # 停了还没释放，说明占用者是别的程序，恢复服务并换下一种方式
+              svc_start
+              stopped='0'
+              hinted="443 端口被其它程序占用，无法使用 TLS-ALPN 验证。请释放 443，或使用 --webroot /var/www/html"
+              warn "$hinted"
+              continue
+            fi
+          else
+            hinted="443 端口被其它程序占用，无法使用 TLS-ALPN 验证。请释放 443，或使用 --webroot /var/www/html"
+            warn "$hinted"
+            continue
+          fi
+        fi
+        info "验证方式：TLS-ALPN（443 端口）"
+        if _try_issue "$domain" alpn '' "$extra"; then
+          [ "$stopped" = '1' ] && { svc_start; stopped='0'; }
+          install_cert "$domain"; return 0
+        fi
+        [ "$stopped" = '1' ] && { svc_start; stopped='0'; }
+        hinted="TLS-ALPN 验证失败，请确认 443 可被外网访问、域名已解析到本机"
+        warn "$hinted"
+        ;;
+    esac
+  done
 
-  install_cert "$domain"
+  error "证书申请失败。
+${hinted:-(所有验证方式均不可用)}
+若不便开放 80/443，可改用 --webroot /var/www/html 指定已有站点的根目录"
 }
 
 install_cert() {
