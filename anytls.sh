@@ -41,24 +41,31 @@ error() { printf '%b\n' "${RED}${BOLD}$*${PLAIN}"; exit 1; }
 line()  { printf '%s\n' "${BLUE}----------------------------------------------------------------${PLAIN}"; }
 
 # 交互读取：兼容 `curl | bash` 场景（stdin 是管道时改从终端读）
+# 注意：内部的临时变量绝不能叫 answer —— 调用方（如 confirm）常把自己的变量命名为
+# answer 并把它传进来，同名会被这里的 local 遮蔽，printf -v 只写到局部变量上，
+# 调用方永远拿到空值（曾导致 confirm 恒为「否」）
 reading() {
-  local prompt="$1" var="$2" default="$3" answer='' rc=0
+  local prompt="$1" var="$2" default="$3" _ans='' rc=0
   if [ -n "$default" ]; then
     prompt="${prompt} [${default}] "
   fi
   if [ -t 0 ]; then
-    read -rp "$prompt" answer || rc=1
-  elif [ -r /dev/tty ]; then
-    read -rp "$prompt" answer < /dev/tty || rc=1
+    read -rp "$prompt" _ans
+    rc=$?
   else
-    read -rp "$prompt" answer || rc=1
+    # stdin 不是终端（`curl | bash` 或重定向）：优先从控制终端读；
+    # 容器 / CI 里常有 /dev/tty 节点却打不开，此时回退到 stdin（与旧行为一致）
+    if ! read -rp "$prompt" _ans < /dev/tty 2>/dev/null; then
+      read -rp "$prompt" _ans
+      rc=$?
+    fi
   fi
   # 非交互环境下读不到输入：不能死循环，直接报错退出
-  if [ "$rc" -ne 0 ] && [ -z "$answer" ]; then
+  if [ "$rc" -ne 0 ] && [ -z "$_ans" ]; then
     error "当前环境无法交互输入，请改用命令行参数（bash $0 help 查看用法）"
   fi
-  [ -z "$answer" ] && answer="$default"
-  printf -v "$var" '%s' "$answer"
+  [ -z "$_ans" ] && _ans="$default"
+  printf -v "$var" '%s' "$_ans"
 }
 
 confirm() {
@@ -362,8 +369,11 @@ install_acme() {
 }
 
 # 单次 ACME 验证尝试；成功返回 0，失败返回非 0（由调用方决定是否换方式）
+# 注意 acme.sh 的返回码语义：0=签发成功；2=RENEW_SKIP（证书已存在且未到续期时间，
+# 属于"无需重签"的正常情况，必须当成功处理）；其它=真失败。
+# 若把 2 当失败，已装过的机器重跑安装会一路回退到最后报"证书申请失败"。
 _try_issue() {
-  local domain="$1" mode="$2" webroot="$3" extra="$4"
+  local domain="$1" mode="$2" webroot="$3" extra="$4" rc=0
   case "$mode" in
     webroot)
       "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra ;;
@@ -372,6 +382,10 @@ _try_issue() {
     alpn)
       "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra ;;
   esac
+  rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || return "$rc"
+  [ "$rc" -eq 2 ] && info "证书已在有效期内，跳过重新签发"
+  return 0
 }
 
 # issue_cert <domain> <webroot> ；webroot 为空时按 standalone(80) -> TLS-ALPN(443) 依次尝试
@@ -463,10 +477,14 @@ install_cert() {
   mkdir -p "$CERT_DIR"
   # acme.sh 的 --install-cert 会立即执行 reloadcmd；此时服务可能尚未创建
   # （首次安装场景），因此 reloadcmd 必须自带容错，否则会误判为“证书安装失败”。
-  "$ACME_BIN" --install-cert -d "$domain" --ecc \
-    --key-file "$KEY_FILE" \
-    --fullchain-file "$CERT_FILE" \
-    --reloadcmd "$(reload_cmd)" || true
+  # 但 --install-cert 自身的返回值必须检查：它失败时（如证书根本没签发成功），
+  # 目录里残留的旧证书会让下面的“文件非空”判断误判为成功。
+  if ! "$ACME_BIN" --install-cert -d "$domain" --ecc \
+      --key-file "$KEY_FILE" \
+      --fullchain-file "$CERT_FILE" \
+      --reloadcmd "$(reload_cmd)"; then
+    error "证书安装失败：acme.sh --install-cert 返回非 0（可能未成功签发，请查看上方 acme.sh 输出）"
+  fi
 
   [ -s "$KEY_FILE" ] && [ -s "$CERT_FILE" ] || error "证书安装失败：${CERT_FILE} 或 ${KEY_FILE} 为空"
 
