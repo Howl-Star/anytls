@@ -941,7 +941,10 @@ main() {
   ACTION='' DOMAIN='' PORT='' PASSWORD='' NODE_NAME='' EMAIL='' WEBROOT='' CORE_VERSION=''
   FORCE_INSTALL=0 NON_INTERACTIVE=0 INSTALL_OPTIONS=0 DEPLOY_DOMAIN=''
   if [ "${0##*/}" = menu ]; then
-    case "${1:-}" in ''|--force|--non-interactive|--domain|--port|--password|--name|--email|--webroot|--version) ACTION=menu ;; esac
+    case "${1:-}" in
+      install|upgrade) error "menu 不支持 $1，请直接运行 bash anytls.sh $1" ;;
+      ''|--force|--non-interactive|--domain|--port|--password|--name|--email|--webroot|--version) ACTION=menu ;;
+    esac
   fi
   parse_args "$@"
   if [ -z "$ACTION" ]; then

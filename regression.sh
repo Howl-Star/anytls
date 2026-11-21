@@ -59,6 +59,10 @@ bash "$sandbox/from-stream.sh" help | grep -F '打开管理菜单' >/dev/null
 cp -- "$sandbox/from-stream.sh" "$sandbox/menu"
 menu_error=$(bash "$sandbox/menu" --domain tls.example.com 2>&1) && fail 'menu accepted an install flag without a subcommand'
 [[ "$menu_error" == *'menu 不支持 --domain'* ]] || fail "unexpected menu error: $menu_error"
+menu_error=$(bash "$sandbox/menu" install --domain tls.example.com 2>&1) && fail 'menu entered install action'
+[[ "$menu_error" == *'menu 不支持 install'* ]] || fail "unexpected menu install error: $menu_error"
+menu_error=$(bash "$sandbox/menu" upgrade 2>&1) && fail 'menu entered upgrade action'
+[[ "$menu_error" == *'menu 不支持 upgrade'* ]] || fail "unexpected menu upgrade error: $menu_error"
 mkdir -p "${MENU_FILE%/*}"
 printf 'other\n' > "$MENU_FILE"
 expect_error menu_available
