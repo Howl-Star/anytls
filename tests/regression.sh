@@ -140,8 +140,9 @@ expect_error bash -c 'source "$1"; TX="$2"; DOMAIN=wrong.example.com; collect_ce
   [[ ${#attempts[@]} = 2 && ${attempts[0]} == *--standalone* && ${attempts[1]} == *--alpn* ]] || fail 'HTTP fallback order'
   : > "$calls"
   http_error='NXDOMAIN'
-  attempt_issue() ( issue_cert 8443; )
-  expect_error attempt_issue
+  if (issue_cert 8443); then
+    fail 'DNS failure unexpectedly succeeded'
+  fi
   mapfile -t attempts < "$calls"
   [[ ${#attempts[@]} = 1 && ${attempts[0]} == *--standalone* ]] || fail 'DNS error must stop fallback'
   : > "$calls"
