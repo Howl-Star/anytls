@@ -1,1154 +1,870 @@
 #!/usr/bin/env bash
-#
-# AnyTLS 一键安装脚本
-# 内核：sing-box（AnyTLS 协议）
-# 证书：域名 + acme.sh 自动申请与续期
-#
-# 用法：
-#   bash anytls.sh                          交互菜单（未安装则进入安装）
-#   bash anytls.sh install --domain a.com    非交互安装
-#   bash anytls.sh info | status | restart | update | renew | uninstall | menu | help
-#
-# 远程一键安装：
-#   bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh)
+# AnyTLS 安装和管理工具。安装成功后运行 menu。
 
-set -o pipefail
+init_paths() {
+  WORK_DIR='/etc/anytls'
+  MENU_FILE='/usr/local/bin/menu'
+  LOCK_FILE='/run/anytls.lock'
+  SYSTEMD_FILE='/etc/systemd/system/anytls.service'
+  OPENRC_FILE='/etc/init.d/anytls'
+  ACME_HOME="${HOME}/.acme.sh"
+  DEFAULT_PORT=8443
+  DEFAULT_CORE_VERSION='1.14.4'
+  GH_RELEASES='https://api.github.com/repos/SagerNet/sing-box/releases'
+  ACME_REVISION='5567d7fe7298fd37aca53194885ba444c6678669' # 3.1.7
+  set_paths
+}
 
-# ==================== 全局常量 ====================
-WORK_DIR='/etc/anytls'
-BIN_FILE="${WORK_DIR}/sing-box"
-CONF_FILE="${WORK_DIR}/config.json"
-ENV_FILE="${WORK_DIR}/anytls.env"
-CERT_DIR="${WORK_DIR}/cert"
-CERT_FILE="${CERT_DIR}/cert.pem"
-KEY_FILE="${CERT_DIR}/private.key"
-INFO_FILE="${WORK_DIR}/anytls.txt"
-SERVICE_NAME='anytls'
-SYSTEMD_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-OPENRC_FILE="/etc/init.d/${SERVICE_NAME}"
+set_paths() {
+  BIN_FILE="$WORK_DIR/sing-box"
+  CONF_FILE="$WORK_DIR/config.json"
+  ENV_FILE="$WORK_DIR/anytls.env"
+  CERT_DIR="$WORK_DIR/cert"
+  CERT_FILE="$CERT_DIR/cert.pem"
+  KEY_FILE="$CERT_DIR/private.key"
+  INFO_FILE="$WORK_DIR/anytls.txt"
+  MANAGER_FILE="$WORK_DIR/manage.sh"
+  ACME_BIN="$ACME_HOME/acme.sh"
+}
 
-DEFAULT_PORT='8443'
-DEFAULT_FP='chrome'
-GH_API='https://api.github.com/repos/SagerNet/sing-box/releases/latest'
+info() { printf '%s\n' "$*"; }
+warn() { printf 'AnyTLS: %s\n' "$*" >&2; }
+error() { warn "$@"; exit 1; }
+need_root() { [ "$(id -u)" = 0 ] || error '请使用 root 运行，或执行 sudo menu'; }
 
-# ==================== 输出函数 ====================
-RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[36m'; BOLD=$'\033[1m'; PLAIN=$'\033[0m'
-
-info()  { printf '%s\n' "${GREEN}${BOLD}$*${PLAIN}"; }
-warn()  { printf '%s\n' "${YELLOW}${BOLD}$*${PLAIN}"; }
-# 多行错误信息用 %b 解析 \n（%s 会把 \n 原样打印出来）
-error() { printf '%b\n' "${RED}${BOLD}$*${PLAIN}"; exit 1; }
-line()  { printf '%s\n' "${BLUE}----------------------------------------------------------------${PLAIN}"; }
-
-# 交互读取：兼容 `curl | bash` 场景（stdin 是管道时改从终端读）
-# 注意：内部的临时变量绝不能叫 answer —— 调用方（如 confirm）常把自己的变量命名为
-# answer 并把它传进来，同名会被这里的 local 遮蔽，printf -v 只写到局部变量上，
-# 调用方永远拿到空值（曾导致 confirm 恒为「否」）
 reading() {
-  local prompt="$1" var="$2" default="$3" _ans='' rc=0
-  if [ -n "$default" ]; then
-    prompt="${prompt} [${default}] "
-  fi
+  local prompt="$1" target="$2" default="$3" input
+  [ "$NON_INTERACTIVE" = 0 ] || error '此操作需要人工确认，请检查参数和当前系统状态'
+  if [ -n "$default" ]; then prompt="$prompt [$default] "; fi
   if [ -t 0 ]; then
-    read -rp "$prompt" _ans
-    rc=$?
+    IFS= read -r -p "$prompt" input || error '无法读取终端输入'
   else
-    # stdin 不是终端（`curl | bash` 或重定向）：优先从控制终端读；
-    # 容器 / CI 里常有 /dev/tty 节点却打不开，此时回退到 stdin（与旧行为一致）
-    if ! read -rp "$prompt" _ans < /dev/tty 2>/dev/null; then
-      read -rp "$prompt" _ans
-      rc=$?
-    fi
+    { IFS= read -r -p "$prompt" input < /dev/tty; } 2>/dev/null || IFS= read -r input || error '无法读取输入，请使用 --non-interactive'
   fi
-  # 非交互环境下读不到输入：不能死循环，直接报错退出
-  if [ "$rc" -ne 0 ] && [ -z "$_ans" ]; then
-    error "当前环境无法交互输入，请改用命令行参数（bash $0 help 查看用法）"
-  fi
-  [ -z "$_ans" ] && _ans="$default"
-  printf -v "$var" '%s' "$_ans"
+  printf -v "$target" '%s' "${input:-$default}"
 }
 
 confirm() {
-  local prompt="$1" answer
-  # 默认值由 reading 负责追加，这里不要再写死 [n]，否则会显示成 "[y/N] [n]"
-  reading "${prompt} (y/N)" answer 'n'
-  [[ "$answer" =~ ^[Yy]$ ]]
+  local answer
+  reading "$1 (y/N)" answer n
+  [[ "$answer" == [Yy] ]]
 }
 
-# ==================== 基础检测 ====================
-need_root() {
-  [ "$(id -u)" = '0' ] || error "请使用 root 用户运行本脚本（sudo -i 后重试）"
+valid_domain() {
+  local LC_ALL=C
+  [ "${#1}" -le 253 ] && [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
+}
+
+valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && [ "$1" -le 65535 ]; }
+valid_password() { [[ "$1" =~ ^[A-Za-z0-9._~-]{6,64}$ ]]; }
+valid_version() { [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]; }
+
+fetch() {
+  curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 5 --max-time 180 -o "${2:--}" "$1"
 }
 
 detect_os() {
-  OS_ID='unknown'; OS_LIKE=''; OS_NAME=''
-  if [ -r /etc/os-release ]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    OS_ID="${ID:-unknown}"
-    OS_LIKE="${ID_LIKE:-}"
-    OS_NAME="${PRETTY_NAME:-$OS_ID}"
-  elif [ -r /etc/redhat-release ]; then
-    OS_ID='centos'; OS_NAME=$(cat /etc/redhat-release)
-  fi
-
-  case "$OS_ID $OS_LIKE" in
-    *debian*|*ubuntu*|*kali*|*raspbian*) PKG_FAMILY='deb' ;;
-    *alpine*)                            PKG_FAMILY='apk' ;;
-    *arch*|*manjaro*)                    PKG_FAMILY='pacman' ;;
-    *suse*|*opensuse*|*sles*)            PKG_FAMILY='zypper' ;;
-    *rhel*|*centos*|*fedora*|*rocky*|*almalinux*|*ol*) PKG_FAMILY='rpm' ;;
-    *)                                   PKG_FAMILY='unknown' ;;
-  esac
-}
-
-pkg_install() {
-  case "$PKG_FAMILY" in
-    deb)    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
-    rpm)    if command -v dnf >/dev/null 2>&1; then dnf install -y -q "$@" >/dev/null 2>&1; else yum install -y -q "$@" >/dev/null 2>&1; fi ;;
-    apk)    apk add --no-cache "$@" >/dev/null 2>&1 ;;
-    pacman) pacman -Sy --noconfirm --needed "$@" >/dev/null 2>&1 ;;
-    zypper) zypper -q install -y "$@" >/dev/null 2>&1 ;;
-    *)      return 1 ;;
-  esac
-}
-
-pkg_update() {
-  case "$PKG_FAMILY" in
-    deb)    apt-get update -qq >/dev/null 2>&1 ;;
-    rpm)    command -v dnf >/dev/null 2>&1 && dnf makecache -q >/dev/null 2>&1 || yum makecache -q >/dev/null 2>&1 ;;
-    apk)    apk update >/dev/null 2>&1 ;;
-    pacman) pacman -Sy >/dev/null 2>&1 ;;
-    zypper) zypper -q refresh >/dev/null 2>&1 ;;
+  local ID='' ID_LIKE=''
+  # shellcheck disable=SC1091
+  if [ -r /etc/os-release ]; then . /etc/os-release; fi
+  case " $ID $ID_LIKE " in
+    *' alpine '*) PKG_FAMILY=apk ;;
+    *' debian '*|*' ubuntu '*|*' kali '*|*' raspbian '*) PKG_FAMILY=deb ;;
+    *' arch '*|*' manjaro '*) PKG_FAMILY=pacman ;;
+    *' suse '*|*' opensuse '*|*' opensuse-leap '*|*' opensuse-tumbleweed '*|*' sles '*) PKG_FAMILY=zypper ;;
+    *' rhel '*|*' centos '*|*' fedora '*|*' rocky '*|*' almalinux '*|*' ol '*) PKG_FAMILY=rpm ;;
+    *) PKG_FAMILY=unknown ;;
   esac
 }
 
 detect_init() {
-  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-    INIT='systemd'
-  elif command -v rc-update >/dev/null 2>&1 && [ -d /etc/init.d ]; then
-    INIT='openrc'
+  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null; then
+    INIT=systemd
+    UNIT_FILE="$SYSTEMD_FILE"
+  elif command -v rc-service >/dev/null && command -v rc-update >/dev/null; then
+    INIT=openrc
+    UNIT_FILE="$OPENRC_FILE"
   else
-    INIT='unknown'
+    INIT=unknown
+    UNIT_FILE=''
+    return 1
   fi
 }
 
 detect_arch() {
-  local musl=''
-  # Alpine / 部分精简系统是 musl，需要用 -musl 版本的二进制
-  if [ "$PKG_FAMILY" = 'apk' ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
-    musl='-musl'
-  fi
-  case "$(uname -m)" in
-    x86_64|amd64)   ARCH="amd64${musl}" ;;
-    aarch64|arm64)  ARCH="arm64${musl}" ;;
-    armv7l|armv7)   ARCH="armv7${musl}" ;;
-    armv6l)
-      # sing-box 只提供 armv6 的 glibc 版，没有 armv6-musl 资产
-      [ -n "$musl" ] && error "sing-box 未提供 armv6 的 musl 版本，Alpine 等 musl 系统请改用 armv7 或 glibc 发行版"
-      ARCH="armv6"
-      ;;
-    i386|i686)      ARCH="386${musl}" ;;
-    s390x)
-      # 同上：s390x 只有 glibc 版
-      [ -n "$musl" ] && error "sing-box 未提供 s390x 的 musl 版本，请改用 glibc 发行版"
-      ARCH="s390x"
-      ;;
-    *)              error "不支持的 CPU 架构：$(uname -m)" ;;
+  local machine musl=''
+  machine=$(uname -m)
+  if [ "$PKG_FAMILY" = apk ] || ldd --version 2>&1 | grep -i musl >/dev/null; then musl='-musl'; fi
+  case "$machine" in
+    x86_64|amd64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    armv7l|armv7) ARCH=armv7 ;;
+    armv6l) ARCH=armv6 ;;
+    i386|i686) ARCH=386 ;;
+    s390x) ARCH=s390x ;;
+    *) error "不支持的 CPU 架构 $machine" ;;
   esac
+  ARCH+="$musl"
 }
 
-# ==================== 依赖 ====================
-# acme.sh 安装器要求系统已有 crontab，否则直接判 Install error 退出
-install_cron() {
-  command -v crontab >/dev/null 2>&1 && return 0
-  pkg_update
+install_packages() {
   case "$PKG_FAMILY" in
-    deb)    pkg_install cron ;;
-    rpm)    pkg_install cronie ;;
-    apk)    pkg_install dcron ;;
-    pacman) pkg_install cronie ;;
-    zypper) pkg_install cron ;;
-    *)      return 1 ;;
+    deb) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    rpm) if command -v dnf >/dev/null; then dnf install -y "$@"; else yum install -y "$@"; fi ;;
+    apk) apk add --no-cache "$@" ;;
+    pacman) pacman -S --needed --noconfirm "$@" ;;
+    zypper) zypper --non-interactive install "$@" ;;
+    *) return 1 ;;
   esac
-  if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-    systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
-  elif command -v rc-update >/dev/null 2>&1; then
-    rc-update add crond default >/dev/null 2>&1 || true
-    rc-service crond start >/dev/null 2>&1 || true
-  fi
-  command -v crontab >/dev/null 2>&1
 }
 
 check_deps() {
-  local need=() c
-  if [ "$PKG_FAMILY" = 'unknown' ]; then
-    warn "未能识别系统包管理器，请手动确保已安装：curl tar openssl socat ca-certificates cron"
-  else
-    for c in curl tar openssl socat; do
-      command -v "$c" >/dev/null 2>&1 || need+=("$c")
-    done
-    if [ "${#need[@]}" -gt 0 ]; then
-      info "安装依赖：${need[*]}"
-      pkg_update
-      local mapped=()
-      for c in "${need[@]}"; do
-        case "$c" in
-          socat) mapped+=('socat') ;;
-          openssl) mapped+=('openssl') ;;
-          tar) mapped+=('tar') ;;
-          curl) mapped+=('curl') ;;
-        esac
-      done
-      pkg_install "${mapped[@]}" || warn "自动安装依赖失败，请手动安装后重试"
-      pkg_install ca-certificates >/dev/null 2>&1 || true
-    fi
-  fi
-
-  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || error "缺少 curl / wget，无法继续"
-
-  # acme.sh 安装器强制要求 crontab，缺失会直接 Install error
-  if ! install_cron; then
-    warn "未能安装 cron，将使用 --force 跳过自动续期任务（需自行再次运行脚本 renew 续期）"
-  fi
-}
-
-# 统一的下载函数（优先 curl，回退 wget）
-fetch() {
-  local url="$1" out="$2"
-  if command -v curl >/dev/null 2>&1; then
-    if [ -n "$out" ]; then curl -fsSL --max-time 60 -o "$out" "$url"; else curl -fsSL --max-time 30 "$url"; fi
-  else
-    if [ -n "$out" ]; then wget -q --timeout=60 -O "$out" "$url"; else wget -q --timeout=30 -O - "$url"; fi
-  fi
-}
-
-# ==================== 网络信息 ====================
-get_public_ip() {
-  local u ip
-  for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip https://ip.sb; do
-    ip=$(fetch "$u" '' 2>/dev/null | tr -d ' \r\n')
-    if printf '%s' "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
-      printf '%s' "$ip"
-      return 0
-    fi
+  local cmd package
+  local -a missing=() required=(curl tar openssl socat jq sha256sum flock ss)
+  for cmd in "${required[@]}"; do
+    if command -v "$cmd" >/dev/null; then continue; fi
+    package="$cmd"
+    case "$PKG_FAMILY:$cmd" in
+      apk:flock) package=flock ;;
+      *:flock) package=util-linux ;;
+      *:sha256sum) package=coreutils ;;
+      rpm:ss) package=iproute ;;
+      *:ss) package=iproute2 ;;
+    esac
+    missing+=("$package")
   done
-  return 1
+  if [ "${#missing[@]}" -gt 0 ]; then
+    install_packages "${missing[@]}" ca-certificates || error "安装依赖失败，请手动安装 ${missing[*]}"
+  fi
+  for cmd in "${required[@]}"; do
+    command -v "$cmd" >/dev/null || error "缺少命令 $cmd"
+  done
+}
+
+ensure_cron() {
+  if ! command -v crontab >/dev/null; then
+    case "$PKG_FAMILY" in
+      deb|zypper) install_packages cron || return 1 ;;
+      apk) install_packages dcron || return 1 ;;
+      rpm|pacman) install_packages cronie || return 1 ;;
+      *) return 1 ;;
+    esac
+  fi
+  if [ "$INIT" = systemd ]; then
+    systemctl enable --now cron 2>/dev/null || systemctl enable --now crond
+  else
+    rc-update add crond default && { rc-service crond status >/dev/null 2>&1 || rc-service crond start; }
+  fi
 }
 
 port_in_use() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -Htln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$" && return 0
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$" && return 0
-  fi
-  return 1
+  ss -H -ltn "sport = :$1" | awk 'NF { found=1 } END { exit !found }'
 }
 
-# 域名解析结果（用于安装前的 DNS 提醒，不阻断流程）
-resolve_domain() {
-  local d="$1"
-  if command -v getent >/dev/null 2>&1; then
-    getent hosts "$d" 2>/dev/null | awk '{print $1}' | tr '\n' ' '
-  elif command -v dig >/dev/null 2>&1; then
-    dig +short A "$d" 2>/dev/null | tr '\n' ' '
-  else
-    ping -c1 -W2 "$d" 2>/dev/null | sed -n '1s/.*(\([0-9.]*\)).*/\1/p'
-  fi
-}
-
-# ==================== 版本与内核 ====================
-get_latest_version() {
-  local json v
-  json=$(fetch "$GH_API" '' 2>/dev/null)
-  # 不依赖 JSON 的换行格式：直接抓第一个 tag_name（API 按发布时间倒序）
-  v=$(printf '%s' "$json" | tr -d ' \r\n' | grep -o '"tag_name":"v\{0,1\}[^"]*"' | head -n1 | sed 's/.*:"v\{0,1\}\(.*\)"/\1/')
-  if [ -z "$v" ]; then
-    v=$(fetch 'https://github.com/SagerNet/sing-box/releases.atom' '' 2>/dev/null \
-      | sed -n 's#.*/releases/tag/v\([^"]*\)".*#\1#p' | sort -Vr | head -n1)
-  fi
-  printf '%s' "$v"
-}
-
-install_core() {
-  local ver="${1:-}" tmp url dir bak="${BIN_FILE}.bak"
-  if [ -z "$ver" ]; then
-    info "获取 sing-box 最新版本..."
-    ver=$(get_latest_version)
-  fi
-  # 归一化：允许 --version v1.14.4，否则会拼出 download/vv1.14.4/ 与 sing-box-v1.14.4-... 两个错地址
-  ver="${ver#v}"
-  [ -n "$ver" ] || error "无法获取 sing-box 版本号，请检查网络后重试（也可手动指定：--version 1.12.0）"
-
-  tmp=$(mktemp -d)
-  url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-${ARCH}.tar.gz"
-  info "下载 sing-box v${ver} (linux-${ARCH})"
-  if ! fetch "$url" "${tmp}/sb.tar.gz"; then
-    rm -rf "$tmp"
-    error "下载失败：$url\n可尝试手动下载后放到 ${BIN_FILE}"
-  fi
-  tar xzf "${tmp}/sb.tar.gz" -C "$tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; error "解压失败"; }
-  dir=$(find "$tmp" -maxdepth 2 -type f -name 'sing-box' -print -quit)
-  [ -n "$dir" ] || { rm -rf "$tmp"; error "压缩包内未找到 sing-box 可执行文件"; }
-
-  mkdir -p "$WORK_DIR"
-  # 先备份旧内核：替换后若新内核跑不起来，还能回滚，不至于把服务搞成「更新完就起不来」
-  rm -f "$bak"
-  [ -x "$BIN_FILE" ] && cp -f "$BIN_FILE" "$bak" 2>/dev/null || true
-  # 先装到同目录的临时文件名，再 mv 原子替换：
-  # 直接覆盖/删除正在运行的二进制会 ETXTBSY，mv 只替换目录项，运行中的进程持有旧 inode
-  install -m 0755 "$dir" "${BIN_FILE}.new" || { rm -rf "$tmp"; error "安装内核失败"; }
-  mv -f "${BIN_FILE}.new" "$BIN_FILE" || { rm -rf "$tmp"; error "替换内核失败"; }
-  rm -rf "$tmp"
-  # 自检：下载到的是不是能给本机跑的可执行文件（架构不符/文件损坏都会在这里暴露）
-  if ! "$BIN_FILE" version >/dev/null 2>&1; then
-    if [ -s "$bak" ]; then
-      mv -f "$bak" "$BIN_FILE"
-      error "新内核无法在本机运行（架构不匹配或文件损坏），已回滚到旧版本"
-    fi
-    error "新内核无法在本机运行（架构不匹配或文件损坏）"
-  fi
-  rm -f "$bak"
-  printf '%s' "$ver" > "${WORK_DIR}/version"
-  info "内核安装完成：v${ver}"
-}
-
-core_version() {
-  # sing-box 的首行是 "sing-box version 1.14.4"，并非 "version 1.14.4"，
-  # 用 /^version/ 匹配会永远得到空字符串
-  [ -x "$BIN_FILE" ] || return 0
-  "$BIN_FILE" version 2>/dev/null | sed -n '1s/.* version \([0-9][^ ]*\).*/\1/p' | head -n1
-}
-
-# ==================== 证书（acme.sh） ====================
-ACME_HOME="${HOME}/.acme.sh"
-ACME_BIN="${ACME_HOME}/acme.sh"
-
-install_acme() {
-  [ -x "$ACME_BIN" ] && return 0
-  info "安装 acme.sh..."
-  mkdir -p "$ACME_HOME"
-  local email_arg=''
-  [ -n "$EMAIL" ] && email_arg="email=${EMAIL}"
-  local installer="${ACME_HOME}/get.sh"
-
-  # acme.sh 安装器没有 crontab 会直接 Install error，必须先备好 cron 或用 --force
-  local force_arg=''
-  if ! command -v crontab >/dev/null 2>&1; then
-    warn "系统未安装 crontab，acme.sh 将以 --force 方式安装（不注册自动续期任务）"
-    force_arg='--force'
-  fi
-
-  # 方式一：官方安装器（保留输出，失败原因可见）
-  fetch https://get.acme.sh "$installer" || true
-  if [ -s "$installer" ]; then
-    sh "$installer" $email_arg $force_arg || true
-  fi
-
-  # 方式二：直接下载 acme.sh 单文件后本地 install（不再二次联网）
-  if [ ! -x "$ACME_BIN" ]; then
-    warn "官方安装器未成功，改用直接下载 acme.sh"
-    fetch "https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh" "$ACME_BIN" || true
-    if [ -s "$ACME_BIN" ]; then
-      chmod +x "$ACME_BIN"
-      "$ACME_BIN" --install --home "$ACME_HOME" $force_arg >/dev/null 2>&1 || true
-    fi
-  fi
-  rm -f "$installer"
-
-  if [ ! -x "$ACME_BIN" ]; then
-    error "acme.sh 安装失败：无法访问 get.acme.sh 或 GitHub
- 请先手动确认出网：curl -I https://raw.githubusercontent.com
- 或手动安装后重跑本脚本：
-  mkdir -p ~/.acme.sh
-  curl -L https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh -o ~/.acme.sh/acme.sh
-  chmod +x ~/.acme.sh/acme.sh"
-  fi
-  "$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-}
-
-# 单次 ACME 验证尝试；成功返回 0，失败返回非 0（由调用方决定是否换方式）
-# 注意 acme.sh 的返回码语义：0=签发成功；2=RENEW_SKIP（证书已存在且未到续期时间，
-# 属于"无需重签"的正常情况，必须当成功处理）；其它=真失败。
-# 若把 2 当失败，已装过的机器重跑安装会一路回退到最后报"证书申请失败"。
-_try_issue() {
-  local domain="$1" mode="$2" webroot="$3" extra="$4" rc=0
-  case "$mode" in
-    webroot)
-      "$ACME_BIN" --issue -d "$domain" -w "$webroot" --keylength ec-256 --server letsencrypt $extra ;;
-    standalone)
-      "$ACME_BIN" --issue -d "$domain" --standalone --httpport 80 --keylength ec-256 --server letsencrypt $extra ;;
-    alpn)
-      "$ACME_BIN" --issue -d "$domain" --alpn --tlsport 443 --keylength ec-256 --server letsencrypt $extra ;;
-  esac
-  rc=$?
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ] || return "$rc"
-  [ "$rc" -eq 2 ] && info "证书已在有效期内，跳过重新签发"
-  return 0
-}
-
-# issue_cert <domain> <webroot> ；webroot 为空时按 standalone(80) -> TLS-ALPN(443) 依次尝试
-issue_cert() {
-  local domain="$1" webroot="$2" extra='' stopped='0' m hinted=''
-  local -a modes=()
-  [ -n "$domain" ] || error "缺少域名，无法申请证书"
-
-  install_acme
-
-  # 已有证书记录时强制重签
-  [ "$FORCE_RENEW" = '1' ] && extra='--force'
-
-  if [ -n "$webroot" ]; then
-    [ -d "$webroot" ] || error "webroot 目录不存在：$webroot"
-    modes=('webroot')
-  else
-    # 80 空闲才试 standalone，否则直接 ALPN。
-    # 关键：standalone 失败必须回退到 ALPN —— 很多云主机（如 AWS 安全组）只放行 443，
-    # 若失败即退出，用户永远装不上。
-    port_in_use 80 || modes+=('standalone')
-    modes+=('alpn')
-  fi
-
-  line
-  info "为 ${domain} 申请 Let's Encrypt 证书"
-
-  for m in "${modes[@]}"; do
-    case "$m" in
-      webroot)
-        info "验证方式：webroot（${webroot}）"
-        if _try_issue "$domain" webroot "$webroot" "$extra"; then
-          install_cert "$domain"; return 0
-        fi
-        hinted="webroot 验证失败。请确认：
-  1) http://${domain}/.well-known/acme-challenge/ 能被外网访问（80/TCP 已放行）
-  2) ${webroot} 是 Web 站点的根目录（如 /var/www/html），且 Nginx/Apache 已运行"
-        ;;
-      standalone)
-        info "验证方式：standalone（80 端口）"
-        if _try_issue "$domain" standalone '' "$extra"; then
-          install_cert "$domain"; return 0
-        fi
-        hinted="standalone 验证失败。请确认云厂商安全组与系统防火墙均已放行 80/TCP，且域名 ${domain} 已解析到本机公网 IP"
-        warn "${hinted}；继续尝试 TLS-ALPN(443)"
-        ;;
-      alpn)
-        # 443 空闲则直接验证；被占用时先判断是不是本服务占的：
-        # 只有本服务在监听才值得停一次试试，否则停服务毫无意义（纯属无谓中断）
-        if port_in_use 443; then
-          if svc_active; then
-            warn "443 端口被占用，临时停止 AnyTLS 服务后重试 TLS-ALPN 验证"
-            svc_stop
-            stopped='1'
-            sleep 1
-            if port_in_use 443; then
-              # 停了还没释放，说明占用者是别的程序，恢复服务并换下一种方式
-              svc_start
-              stopped='0'
-              hinted="443 端口被其它程序占用，无法使用 TLS-ALPN 验证。请释放 443，或使用 --webroot /var/www/html"
-              warn "$hinted"
-              continue
-            fi
-          else
-            hinted="443 端口被其它程序占用，无法使用 TLS-ALPN 验证。请释放 443，或使用 --webroot /var/www/html"
-            warn "$hinted"
-            continue
-          fi
-        fi
-        info "验证方式：TLS-ALPN（443 端口）"
-        if _try_issue "$domain" alpn '' "$extra"; then
-          [ "$stopped" = '1' ] && { svc_start; stopped='0'; }
-          install_cert "$domain"; return 0
-        fi
-        [ "$stopped" = '1' ] && { svc_start; stopped='0'; }
-        hinted="TLS-ALPN 验证失败，请确认 443 可被外网访问、域名已解析到本机"
-        warn "$hinted"
-        ;;
-    esac
-  done
-
-  error "证书申请失败。
-${hinted:-(所有验证方式均不可用)}
-若不便开放 80/443，可改用 --webroot /var/www/html 指定已有站点的根目录"
-}
-
-install_cert() {
-  local domain="$1"
-  mkdir -p "$CERT_DIR"
-  # acme.sh 的 --install-cert 会立即执行 reloadcmd；此时服务可能尚未创建
-  # （首次安装场景），因此 reloadcmd 必须自带容错，否则会误判为“证书安装失败”。
-  # 但 --install-cert 自身的返回值必须检查：它失败时（如证书根本没签发成功），
-  # 目录里残留的旧证书会让下面的“文件非空”判断误判为成功。
-  if ! "$ACME_BIN" --install-cert -d "$domain" --ecc \
-      --key-file "$KEY_FILE" \
-      --fullchain-file "$CERT_FILE" \
-      --reloadcmd "$(reload_cmd)"; then
-    error "证书安装失败：acme.sh --install-cert 返回非 0（可能未成功签发，请查看上方 acme.sh 输出）"
-  fi
-
-  [ -s "$KEY_FILE" ] && [ -s "$CERT_FILE" ] || error "证书安装失败：${CERT_FILE} 或 ${KEY_FILE} 为空"
-
-  chmod 600 "$KEY_FILE"
-  chmod 644 "$CERT_FILE"
-  info "证书已部署：${CERT_FILE}"
-}
-
-# 续期时用于重载服务的命令（写入 acme.sh 的 reloadcmd）
-# 末尾的 || true 是必需的：acme.sh 在 --install-cert 阶段就会执行该命令，
-# 首次安装时 anytls.service 还不存在，不能因此中断安装流程。
-reload_cmd() {
-  if [ "$INIT" = 'systemd' ]; then
-    printf 'systemctl restart %s >/dev/null 2>&1 || true' "$SERVICE_NAME"
-  else
-    printf 'rc-service %s restart >/dev/null 2>&1 || true' "$SERVICE_NAME"
-  fi
-}
-
-# ==================== 配置文件 ====================
-write_config() {
-  mkdir -p "$WORK_DIR"
-  # listen 选择：有 IPv6 时用 "::"（Linux 下默认 dual-stack，同时收 IPv4/IPv6），
-  # 内核禁用了 IPv6（ipv6.disable=1）时 "::" 会绑定失败导致服务起不来，改用 0.0.0.0
-  local listen_addr='::'
-  [ -f /proc/net/if_inet6 ] || listen_addr='0.0.0.0'
-  # 密码由 valid_password 约束为 [A-Za-z0-9._~-]，不含引号与反斜杠，可安全直接嵌入
-  cat > "$CONF_FILE" <<EOF
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "${listen_addr}",
-      "listen_port": ${PORT},
-      "users": [
-        {
-          "password": "${PASSWORD}"
-        }
-      ],
-      "padding_scheme": [],
-      "tls": {
-        "enabled": true,
-        "server_name": "${DOMAIN}",
-        "certificate_path": "${CERT_FILE}",
-        "key_path": "${KEY_FILE}"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ]
-}
-EOF
-  chmod 600 "$CONF_FILE"
-}
-
-# 单引号安全写入 env 文件（值里的 ' 转义为 '\''）
-sq() { printf '%s' "$1" | sed "s/'/'\\\\''/g"; }
-
+# 保存格式兼容旧版，但读取时把每一行当成数据，避免以 root 执行配置文件。
 save_env() {
-  cat > "$ENV_FILE" <<EOF
-DOMAIN='$(sq "${DOMAIN}")'
-PORT='$(sq "${PORT}")'
-PASSWORD='$(sq "${PASSWORD}")'
-NODE_NAME='$(sq "${NODE_NAME}")'
-EMAIL='$(sq "${EMAIL}")'
-WEBROOT='$(sq "${WEBROOT}")'
-EOF
-  chmod 600 "$ENV_FILE"
+  local key escaped
+  for key in DOMAIN PORT PASSWORD NODE_NAME EMAIL WEBROOT; do
+    escaped=${!key}
+    escaped=${escaped//\'/\'\\\'\'}
+    printf "%s='%s'\n" "$key" "$escaped" || return 1
+  done
 }
 
 load_env() {
-  [ -s "$ENV_FILE" ] || error "未检测到安装信息（${ENV_FILE}），请先执行安装"
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
+  local entry key value quote="'" escaped="'\\''"
+  [ -s "$ENV_FILE" ] || return 1
+  DOMAIN='' PORT='' PASSWORD='' NODE_NAME='' EMAIL='' WEBROOT=''
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    key=${entry%%=*}
+    value=${entry#*=}
+    case "$key" in DOMAIN|PORT|PASSWORD|NODE_NAME|EMAIL|WEBROOT) ;; *) return 1 ;; esac
+    [[ "$value" == "$quote"*"$quote" && ${#value} -ge 2 ]] || return 1
+    value=${value:1:${#value}-2}
+    value=${value//"$escaped"/"$quote"}
+    printf -v "$key" '%s' "$value"
+  done < "$ENV_FILE"
+  valid_domain "$DOMAIN" && valid_port "$PORT" && valid_password "$PASSWORD"
 }
 
-is_installed() {
-  [ -s "$ENV_FILE" ] && [ -x "$BIN_FILE" ]
+is_installed() { [ -s "$ENV_FILE" ] && [ -x "$BIN_FILE" ]; }
+require_install() { load_env || error '未安装 AnyTLS，或安装配置无法读取'; }
+
+lock_work() {
+  command -v flock >/dev/null || error '需要 flock，请安装 util-linux 或运行新版安装脚本补齐依赖'
+  exec 9>"$LOCK_FILE" || error "无法打开锁文件 $LOCK_FILE"
+  flock -n 9 || error '有另一个 AnyTLS 操作正在运行，请稍后再试'
 }
 
-# ==================== 服务管理 ====================
-write_service() {
-  detect_init
+# 每次写入在同一文件系统上准备候选文件，旧内容保留至服务检查通过。
+start_transaction() {
+  local target
+  mkdir -p "$WORK_DIR" || error "无法创建 $WORK_DIR"
+  [ ! -L "$WORK_DIR" ] && chmod 700 "$WORK_DIR" || error "无法保护 $WORK_DIR"
+  TX=$(mktemp -d "$WORK_DIR/.txn.XXXXXXXX") || error '无法创建事务目录'
+  TX_TARGETS=("$@")
+  TX_CHANGED=0 TX_COMMITTED=0 TX_WAS_ACTIVE=0 TX_SERVICE_CREATED=0 TX_MENU_CREATED=0 TX_RESTART=0
+  TX_ACME_CONF=''
+  trap finish_transaction EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  mkdir "$TX/old" || error '无法创建备份目录'
+  if svc_active; then TX_WAS_ACTIVE=1; fi
+  for target in "${TX_TARGETS[@]}"; do
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      [ -f "$target" ] && [ ! -L "$target" ] || error "不能替换非普通文件 $target"
+      cp -p -- "$target" "$TX/old/${target##*/}" || error "备份失败 $target"
+    fi
+  done
+}
+
+publish_files() {
+  local target
+  TX_CHANGED=1
+  for target in "$@"; do
+    mv -f -- "$TX/${target##*/}" "$target" || error "无法替换 $target"
+  done
+}
+
+finish_transaction() {
+  local rc=$? target failed=0
+  trap - EXIT
+  trap '' INT TERM
+  if [ "$TX_COMMITTED" = 0 ]; then
+    if [ "$TX_RESTART" = 1 ]; then svc_stop || true; fi
+    if [ "$TX_CHANGED" = 1 ]; then
+      for target in "${TX_TARGETS[@]}"; do
+        if [ -e "$TX/old/${target##*/}" ]; then
+          cp -p -- "$TX/old/${target##*/}" "$TX/restore" && mv -f -- "$TX/restore" "$target" || failed=1
+        else
+          rm -f -- "$target" || failed=1
+        fi
+      done
+    fi
+    if [ -n "$TX_ACME_CONF" ]; then
+      if [ -f "$TX/old/acme-domain.conf" ]; then
+        restore_acme_conf || failed=1
+      else
+        rm -f -- "$TX_ACME_CONF" || failed=1
+      fi
+    fi
+    if [ "$TX_MENU_CREATED" = 1 ]; then remove_menu || failed=1; fi
+    if [ "$TX_SERVICE_CREATED" = 1 ]; then remove_service || failed=1; fi
+    if [ "$TX_RESTART" = 1 ] && [ "$TX_WAS_ACTIVE" = 1 ]; then
+      svc_start && service_ready || failed=1
+    fi
+    if [ "$failed" = 1 ]; then
+      warn "自动回滚未完成，备份保存在 $TX/old"
+      exit 1
+    fi
+    if [ "$TX_CHANGED" = 1 ]; then warn '已恢复原有文件和服务运行状态'; fi
+  fi
+  rm -rf -- "$TX"
+  exit "$rc"
+}
+
+prepare_core() {
+  local requested="${1#v}" release name digest url
+  if [ -n "$requested" ]; then
+    valid_version "$requested" || error "无效的内核版本 $requested"
+    release="$GH_RELEASES/tags/v$requested"
+  else
+    release="$GH_RELEASES/latest"
+  fi
+  fetch "$release" "$TX/release.json" || error '无法读取 sing-box 发布信息'
+  CORE_TAG=$(jq -er '.tag_name | select(type == "string")' "$TX/release.json") || error '发布信息缺少版本号'
+  valid_version "$CORE_TAG" || error '上游版本号格式不正确'
+  if [ -n "$requested" ] && [ "${CORE_TAG#v}" != "$requested" ]; then error '上游返回版本与请求不一致'; fi
+  name="sing-box-${CORE_TAG#v}-linux-$ARCH.tar.gz"
+  digest=$(jq -er --arg name "$name" '.assets[] | select(.name == $name) | .digest | select(type == "string")' "$TX/release.json") || error "上游没有提供带校验值的资产 $name"
+  [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || error "资产校验值无效 $name"
+  url="https://github.com/SagerNet/sing-box/releases/download/$CORE_TAG/$name"
+  info "下载 sing-box $CORE_TAG ($ARCH)"
+  fetch "$url" "$TX/core.tar.gz" || error '内核下载失败'
+  (cd "$TX" && printf '%s  core.tar.gz\n' "${digest#sha256:}" | sha256sum -c -) || error '内核 SHA-256 校验失败'
+  tar -xOzf "$TX/core.tar.gz" "${name%.tar.gz}/sing-box" > "$TX/sing-box" || error '无法提取 sing-box'
+  chmod 755 "$TX/sing-box" && "$TX/sing-box" version >/dev/null || error '候选内核无法运行'
+  printf '%s\n' "${CORE_TAG#v}" > "$TX/version" || error '无法保存版本号'
+}
+
+core_version() { "$BIN_FILE" version 2>/dev/null | sed -n '1s/^sing-box version \([^ ]*\).*/\1/p'; }
+
+write_config() {
+  local cert="$1" key="$2" listen='::'
+  if [ ! -f /proc/net/if_inet6 ]; then listen='0.0.0.0'; fi
+  jq -n --arg listen "$listen" --argjson port "$PORT" --arg password "$PASSWORD" \
+    --arg domain "$DOMAIN" --arg cert "$cert" --arg key "$key" '
+    {log:{level:"info",timestamp:true},inbounds:[{type:"anytls",tag:"anytls-in",listen:$listen,
+     listen_port:$port,users:[{password:$password}],padding_scheme:[],
+     tls:{enabled:true,server_name:$domain,certificate_path:$cert,key_path:$key}}],
+     outbounds:[{type:"direct",tag:"direct"}]}'
+}
+
+svc() {
   case "$INIT" in
-    systemd)
-      cat > "$SYSTEMD_FILE" <<EOF
-[Unit]
-Description=AnyTLS service (sing-box)
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-
-[Service]
-User=root
-Type=simple
-NoNewPrivileges=yes
-WorkingDirectory=${WORK_DIR}
-ExecStart=${BIN_FILE} run -c ${CONF_FILE}
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-      systemctl daemon-reload >/dev/null 2>&1
-      systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
-      ;;
-    openrc)
-      cat > "$OPENRC_FILE" <<EOF
-#!/sbin/openrc-run
-
-name="AnyTLS service (sing-box)"
-description="AnyTLS service based on sing-box"
-command="${BIN_FILE}"
-command_args="run -c ${CONF_FILE}"
-command_background="yes"
-pidfile="/run/${SERVICE_NAME}.pid"
-output_log="/var/log/${SERVICE_NAME}.log"
-error_log="/var/log/${SERVICE_NAME}.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-      chmod +x "$OPENRC_FILE"
-      rc-update add "$SERVICE_NAME" default >/dev/null 2>&1
-      ;;
-    *)
-      error "未检测到 systemd / openrc，本脚本暂不支持当前 init 系统"
-      ;;
-  esac
-}
-
-svc_start() {
-  case "$INIT" in
-    systemd) systemctl start "$SERVICE_NAME" >/dev/null 2>&1 ;;
-    openrc)  rc-service "$SERVICE_NAME" start >/dev/null 2>&1 ;;
-  esac
-}
-
-svc_stop() {
-  case "$INIT" in
-    systemd) systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 ;;
-    openrc)  rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 ;;
-  esac
-}
-
-svc_restart() {
-  case "$INIT" in
-    systemd) systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 ;;
-    openrc)  rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 ;;
+    systemd) systemctl "$1" anytls 9>&- ;;
+    openrc) rc-service anytls "$1" 9>&- ;;
+    *) return 1 ;;
   esac
 }
 
 svc_active() {
   case "$INIT" in
-    systemd) systemctl is-active --quiet "$SERVICE_NAME" ;;
-    openrc)  rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
-    *)       return 1 ;;
+    systemd) systemctl is-active --quiet anytls ;;
+    openrc) rc-service anytls status >/dev/null 2>&1 ;;
+    *) return 1 ;;
   esac
 }
+
+svc_start() { svc start; }
+svc_stop() { svc stop; }
+svc_restart() { svc restart; }
 
 svc_log() {
   case "$INIT" in
-    systemd) journalctl -u "$SERVICE_NAME" -n 60 --no-pager ;;
-    openrc)  tail -n 60 "/var/log/${SERVICE_NAME}.log" 2>/dev/null ;;
+    systemd) journalctl -u anytls -n 40 --no-pager ;;
+    openrc) tail -n 40 /var/log/anytls.log ;;
   esac
 }
 
-# ==================== 校验 ====================
-valid_domain() {
-  printf '%s' "$1" | grep -Eq '^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+service_ready() {
+  sleep 2
+  svc_active
 }
 
-valid_port() {
-  # 拒绝前导零：JSON 数字不允许 08443 这种写法，否则 sing-box 解析配置直接失败
-  printf '%s' "$1" | grep -Eq '^(0|[1-9][0-9]{0,4})$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+apply_service() {
+  TX_RESTART=1
+  if { if [ "$TX_WAS_ACTIVE" = 1 ]; then svc_restart; else svc_start; fi; } && service_ready; then return 0; fi
+  svc_log >&2 || true
+  error '服务启动检查失败'
 }
 
-valid_password() {
-  # 只允许 URL 安全字符，避免分享链接被截断；同时排除会破坏 JSON / YAML 的字符
-  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._~-]{6,64}$'
+write_service() {
+  case "$INIT" in
+    systemd)
+      cat <<EOF
+[Unit]
+Description=AnyTLS service (sing-box)
+After=network.target nss-lookup.target
+
+[Service]
+Type=exec
+User=root
+NoNewPrivileges=yes
+WorkingDirectory=$WORK_DIR
+ExecStart=$BIN_FILE run -c $CONF_FILE
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      ;;
+    openrc)
+      cat <<EOF
+#!/sbin/openrc-run
+name="AnyTLS service (sing-box)"
+command="$BIN_FILE"
+command_args="run -c $CONF_FILE"
+command_background="yes"
+pidfile="/run/anytls.pid"
+output_log="/var/log/anytls.log"
+error_log="/var/log/anytls.log"
+depend() { need net; after firewall; }
+EOF
+      ;;
+  esac
 }
 
-gen_password() {
-  # 纯十六进制：既符合 AnyTLS 密码要求，也可直接裸写进 JSON / YAML，无需加引号
-  if command -v openssl >/dev/null 2>&1; then
-    openssl rand -hex 16
+create_service() {
+  [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] || return 0
+  TX_SERVICE_CREATED=1
+  local tmp mode=644
+  if [ "$INIT" = openrc ]; then mode=755; fi
+  tmp=$(mktemp "${UNIT_FILE}.XXXXXXXX") || return 1
+  if ! write_service > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$UNIT_FILE"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+  if [ "$INIT" = systemd ]; then
+    systemctl daemon-reload && systemctl enable anytls
   else
-    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32
+    rc-update add anytls default
   fi
 }
 
-# ==================== 节点信息输出 ====================
+remove_service() {
+  [ -e "$UNIT_FILE" ] || return 0
+  if [ "$INIT" = systemd ]; then
+    systemctl disable anytls || return 1
+    rm -f -- "$UNIT_FILE" && systemctl daemon-reload
+  else
+    rc-update del anytls default && rm -f -- "$UNIT_FILE"
+  fi
+}
+
+owns_menu() { [ -L "$MENU_FILE" ] && [ "$(readlink "$MENU_FILE")" = "$MANAGER_FILE" ]; }
+menu_available() { owns_menu || { [ ! -e "$MENU_FILE" ] && [ ! -L "$MENU_FILE" ]; }; }
+
+# 普通文件直接复制。进程替换和管道不可重读，其本地副本由当前已加载函数组成。
+prepare_manager() {
+  local dest="$1"
+  if [ -f "$SCRIPT_SOURCE" ] && [[ "$SCRIPT_SOURCE" != /dev/fd/* && "$SCRIPT_SOURCE" != /proc/*/fd/* ]]; then
+    install -m 755 -- "$SCRIPT_SOURCE" "$dest" || return 1
+  else
+    {
+      printf '#!/usr/bin/env bash\n'
+      declare -f
+      printf '\nif [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi\n'
+    } > "$dest" && chmod 755 "$dest" || return 1
+  fi
+  bash -n "$dest"
+}
+
+install_menu() {
+  if owns_menu; then return 0; fi
+  mkdir -p "${MENU_FILE%/*}" && ln -sT -- "$MANAGER_FILE" "$MENU_FILE" || return 1
+  TX_MENU_CREATED=1
+}
+
+remove_menu() {
+  if owns_menu; then rm -- "$MENU_FILE"; fi
+}
+
+install_acme() {
+  local -a args=(--install --home "$ACME_HOME" --noprofile)
+  if [ -x "$ACME_BIN" ]; then return 0; fi
+  mkdir -p "$ACME_HOME" || error '无法创建 acme.sh 安装目录'
+  if [ -n "$EMAIL" ]; then args+=(--accountemail "$EMAIL"); fi
+  if ! command -v crontab >/dev/null; then args+=(--force); fi
+  fetch "https://raw.githubusercontent.com/acmesh-official/acme.sh/$ACME_REVISION/acme.sh" "$TX/acme.sh" || error '下载 acme.sh 失败'
+  (cd "$TX" && sh ./acme.sh "${args[@]}") && [ -x "$ACME_BIN" ] || error 'acme.sh 安装失败'
+}
+
+acme() { "$ACME_BIN" --home "$ACME_HOME" "$@"; }
+
+backup_acme_conf() {
+  local conf
+  conf=$(acme --info -d "$DOMAIN" --ecc 2>/dev/null | sed -n 's/^DOMAIN_CONF=//p')
+  [[ "$conf" == /*/"$DOMAIN.conf" && "$conf" != *$'\n'* ]] || error 'acme.sh 未返回可用的域名配置路径'
+  if [ -e "$conf" ]; then
+    [ -f "$conf" ] && [ ! -L "$conf" ] || error '无法备份此 acme.sh 域名配置'
+    cp -p -- "$conf" "$TX/old/acme-domain.conf" || error '备份 acme.sh 域名配置失败'
+  fi
+  TX_ACME_CONF="$conf"
+}
+
+restore_acme_conf() {
+  local restore
+  restore=$(mktemp "${TX_ACME_CONF}.restore.XXXXXXXX") || return 1
+  if cp -p -- "$TX/old/acme-domain.conf" "$restore" && mv -f -- "$restore" "$TX_ACME_CONF"; then return 0; fi
+  rm -f -- "$restore"
+  return 1
+}
+
+try_issue() {
+  local rc=0
+  acme --issue --server letsencrypt -d "$DOMAIN" --keylength ec-256 "${ISSUE_ARGS[@]}" "$@" || rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 2 ]
+}
+
+issue_cert() {
+  local old_port="$1"
+  local -a ISSUE_ARGS=()
+  if [ -n "$EMAIL" ]; then ISSUE_ARGS+=(--accountemail "$EMAIL"); fi
+  if [ "$ACTION" = renew ] || [ "${FORCE_ISSUE:-0}" = 1 ]; then ISSUE_ARGS+=(--force); fi
+  if [ -n "$WEBROOT" ]; then
+    try_issue -w "$WEBROOT" || error 'webroot 验证失败，请检查站点路径和 80/TCP'
+    return 0
+  fi
+  if ! port_in_use 80 && try_issue --standalone --httpport 80; then return 0; fi
+  if port_in_use 443; then
+    if [ "$old_port" != 443 ] || [ "$TX_WAS_ACTIVE" != 1 ]; then
+      error '443/TCP 已被占用，请使用 --webroot 或释放验证端口'
+    fi
+    TX_RESTART=1
+    svc_stop || error '临时停止 AnyTLS 失败'
+    if port_in_use 443; then error '443/TCP 仍被占用，请使用 --webroot'; fi
+  fi
+  try_issue --alpn --tlsport 443 || error 'ACME 签发失败，请检查域名解析、80/443 和防火墙'
+}
+
+incoming_path() { printf '%s/incoming/%s' "$CERT_DIR" "$1"; }
+
+collect_cert() {
+  local inbox="$1" cert_pub key_pub
+  [ -s "$inbox/cert.pem" ] && [ -s "$inbox/private.key" ] || error 'ACME 未交付证书或私钥'
+  openssl x509 -in "$inbox/cert.pem" -noout -checkend 0 >/dev/null || error '证书无效或已过期'
+  LC_ALL=C openssl x509 -in "$inbox/cert.pem" -noout -checkhost "$DOMAIN" > "$TX/x509-check" || error '证书与安装域名不匹配'
+  grep -Fq ' does match certificate' "$TX/x509-check" || error '证书与安装域名不匹配'
+  cert_pub=$(openssl x509 -in "$inbox/cert.pem" -noout -pubkey) || error '无法读取证书公钥'
+  key_pub=$(openssl pkey -in "$inbox/private.key" -pubout) || error '无法读取私钥'
+  [ "$cert_pub" = "$key_pub" ] || error '证书与私钥不匹配'
+  install -m 600 -- "$inbox/private.key" "$TX/private.key" && install -m 644 -- "$inbox/cert.pem" "$TX/cert.pem" || error '无法准备证书文件'
+}
+
+configure_cert() {
+  local inbox
+  inbox=$(incoming_path "$DOMAIN")
+  mkdir -p "$inbox" || error '无法创建证书写入目录'
+  rm -f -- "$inbox/cert.pem" "$inbox/private.key" || error '无法清理旧候选证书'
+  # --install-cert 会当场运行 hook。本次由持锁调用者部署，cron 下次续期由同一入口部署。
+  ANYTLS_DEFER_DEPLOY=1 acme --install-cert -d "$DOMAIN" --ecc \
+    --key-file "$inbox/private.key" --fullchain-file "$inbox/cert.pem" \
+    --reloadcmd "if [ \"\${ANYTLS_DEFER_DEPLOY:-0}\" != 1 ]; then \"$MANAGER_FILE\" deploy-cert $DOMAIN; fi" || error 'acme.sh 部署证书失败'
+  collect_cert "$inbox"
+}
+
 url_encode() {
-  # 必须强制 C locale 按字节处理：Linux 上通常是 C.UTF-8，此时 ${#s} 是字符数、
-  # ${s:i:1} 取的是整个多字节字符，printf '%02X' "'香" 只会得到末字节 0x99，
-  # 中文节点名会被编码成 %9999 之类的垃圾
-  local LC_ALL=C s="$1" out='' c i
-  for ((i = 0; i < ${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      [a-zA-Z0-9.~_-]) out+="$c" ;;
-      *) out+=$(printf '%%%02X' "'$c") ;;
-    esac
+  local LC_ALL=C value="$1" i byte
+  for ((i=0; i<${#value}; i++)); do
+    byte=${value:i:1}
+    case "$byte" in [a-zA-Z0-9.~_-]) printf '%s' "$byte" ;; *) printf '%%%02X' "'$byte" ;; esac
   done
-  printf '%s' "$out"
 }
 
 build_links() {
-  local tag enc_name clash_link uri server
-  SERVER_IP=$(get_public_ip 2>/dev/null)
+  local tag name
+  tag=$(url_encode "$NODE_NAME")
+  name=${NODE_NAME//\\/\\\\}
+  name=${name//\"/\\\"}
+  cat <<EOF
+AnyTLS 节点信息（含密码，请妥善保存）
 
-  # 脚本使用域名 + Let's Encrypt 证书，证书 SAN 只含域名。
-  # 客户端必须用域名连接才能通过校验，因此链接里统一填域名。
-  server="$DOMAIN"
-  if [ -z "$SERVER_IP" ]; then
-    ALT_HINT='未能获取公网 IP，请确认域名已解析到本机'
-  else
-    ALT_HINT="本机公网 IP：${SERVER_IP}（客户端请填域名 ${DOMAIN}；若域名未解析，可临时改用该 IP 并在客户端开启 skip-cert-verify）"
-  fi
+anytls://$PASSWORD@$DOMAIN:$PORT?idle_session_check_interval=30s&idle_session_timeout=30s&min_idle_session=5&security=tls&sni=$DOMAIN&fp=chrome#$tag
 
-  enc_name=$(url_encode "${NODE_NAME}")
-
-  # YAML 双引号字符串里 " 和 \ 必须转义，否则节点名带引号会让配置整体非法
-  yaml_name=${NODE_NAME//\\/\\\\}
-  yaml_name=${yaml_name//\"/\\\"}
-
-  # 参数对齐 fscarmen/sing-box 的实现：anytls 专有字段 + 标准 tls 字段
-  uri="anytls://${PASSWORD}@${server}:${PORT}?idle_session_check_interval=30s&idle_session_timeout=30s&min_idle_session=5&security=tls&sni=${DOMAIN}&fp=${DEFAULT_FP}#${enc_name}"
-
-  # password 加引号：纯数字密码不加引号会被 YAML 解析成整数，mihomo 期望字符串
-  clash_link="- name: \"${yaml_name}\"
+Clash / mihomo
+- name: "$name"
   type: anytls
-  server: ${server}
-  port: ${PORT}
-  password: \"${PASSWORD}\"
-  client-fingerprint: ${DEFAULT_FP}
-  sni: ${DOMAIN}
+  server: $DOMAIN
+  port: $PORT
+  password: "$PASSWORD"
+  client-fingerprint: chrome
+  sni: $DOMAIN
   udp: true
   idle-session-check-interval: 30
   idle-session-timeout: 30
-  skip-cert-verify: false"
-
-  LINKS=$(cat <<EOF
-================================================================
- AnyTLS 节点信息
-================================================================
- 节点名称 : ${NODE_NAME}
- 服务器   : ${server}
- 端口     : ${PORT}
- 密码     : ${PASSWORD}
- SNI      : ${DOMAIN}
- 客户端指纹: ${DEFAULT_FP}
- 备注     : ${ALT_HINT}
-================================================================
-
-【分享链接（sing-box / v2rayN / NekoBox 等）】
-${uri}
-
-【Clash / mihomo 配置】
-${clash_link}
-
-【订阅文件】${INFO_FILE}
-================================================================
+  skip-cert-verify: false
 EOF
-)
 }
 
-show_info() {
-  load_env
-  detect_init
-  build_links
-  printf '%s\n' "$LINKS"
-  if [ "$1" = 'save' ]; then
-    mkdir -p "$WORK_DIR"
-    printf '%s\n' "$LINKS" > "$INFO_FILE"
-    chmod 600 "$INFO_FILE"
-    info "节点信息已保存到 ${INFO_FILE}"
+validate_install_params() {
+  if [ "$NON_INTERACTIVE" = 1 ]; then
+    PORT=${PORT:-$DEFAULT_PORT}
+  else
+    if [ -z "$DOMAIN" ]; then reading '请输入证书域名: ' DOMAIN ''; fi
+    if [ -z "$PORT" ]; then reading '请输入监听端口: ' PORT "$DEFAULT_PORT"; fi
+    if [ -z "$EMAIL" ]; then reading '请输入邮箱（可留空）: ' EMAIL ''; fi
   fi
+  valid_domain "$DOMAIN" || error '请通过 --domain 提供有效域名'
+  DOMAIN=${DOMAIN,,}
+  valid_port "$PORT" || error "无效监听端口 $PORT"
+  if [ -n "$PASSWORD" ]; then valid_password "$PASSWORD" || error '密码应为 6 至 64 位 URL 安全字符'; fi
+  if [ -n "$CORE_VERSION" ]; then valid_version "$CORE_VERSION" || error "无效的内核版本 $CORE_VERSION"; fi
+  if [ -n "$WEBROOT" ]; then [[ "$WEBROOT" == /* && -d "$WEBROOT" ]] || error 'webroot 必须是存在的绝对路径'; fi
+  NODE_NAME=${NODE_NAME:-AnyTLS-$DOMAIN}
+  local LC_ALL=C
+  if [[ "$NODE_NAME$EMAIL$WEBROOT" =~ [[:cntrl:]] ]]; then error '节点名、邮箱和 webroot 不能包含控制字符'; fi
 }
 
-# ==================== 安装 ====================
-do_install() {
+do_install() (
   need_root
   detect_os
-  detect_arch
-  detect_init
-
-  if is_installed && [ "$FORCE_INSTALL" != '1' ]; then
-    warn "检测到 AnyTLS 已安装。重新安装会覆盖配置。"
-    confirm "确认重新安装？" || { info "已取消"; exit 0; }
+  detect_init || error '需要 systemd 或 OpenRC'
+  menu_available || error "$MENU_FILE 已被其他程序使用，请先处理同名文件"
+  validate_install_params
+  local reinstall_confirmed=0
+  if is_installed && [ "$FORCE_INSTALL" = 0 ]; then
+    if [ "$NON_INTERACTIVE" = 1 ]; then error '已安装，非交互重装需要 --force'; fi
+    confirm '覆盖现有配置？' || exit 0
+    reinstall_confirmed=1
   fi
-
-  line
-  info "系统：${OS_NAME:-未知}    架构：${ARCH}    服务管理：${INIT}"
-  line
-
   check_deps
-
-  # ---------- 交互补全缺失参数 ----------
-  if [ -z "$DOMAIN" ]; then
-    while [ -z "$DOMAIN" ]; do
-      reading "请输入证书域名（必须已解析到本机）: " DOMAIN ''
-      [ -z "$DOMAIN" ] && warn "域名不能为空"
-    done
+  lock_work
+  menu_available || error "$MENU_FILE 已被其他程序使用"
+  local old_port='' old_domain='' old_webroot='' running=0 FORCE_ISSUE=0
+  if is_installed; then
+    [ "$FORCE_INSTALL" = 1 ] || [ "$reinstall_confirmed" = 1 ] || error '检测到另一项操作已完成安装，请重新执行安装命令'
+    local saved
+    saved=$(load_env && printf '%s %s\n%s' "$PORT" "${DOMAIN,,}" "$WEBROOT") || error '无法读取现有安装配置'
+    {
+      read -r old_port old_domain
+      IFS= read -r old_webroot
+    } <<< "$saved"
+    if [ "$old_domain" = "$DOMAIN" ] && [ "$old_webroot" != "$WEBROOT" ]; then FORCE_ISSUE=1; fi
+    if svc_active; then running=1; fi
+  elif [ -e "$UNIT_FILE" ] || [ -L "$UNIT_FILE" ]; then
+    error "已存在服务文件 $UNIT_FILE，请先确认旧安装状态"
   fi
-  valid_domain "$DOMAIN" || error "域名格式不正确：$DOMAIN"
-
-  [ -z "$PORT" ] && reading "请输入监听端口: " PORT "$DEFAULT_PORT"
-  valid_port "$PORT" || error "端口不合法：$PORT"
-
-  [ -z "$PASSWORD" ] && PASSWORD=$(gen_password)
-  valid_password "$PASSWORD" || error "密码只能包含字母数字和 ._~- ，长度 6-64"
-
-  if [ -z "$NODE_NAME" ]; then
-    NODE_NAME="AnyTLS-${DOMAIN}"
+  if port_in_use "$PORT" && { [ "$running" != 1 ] || [ "$PORT" != "$old_port" ]; }; then
+    error "端口 $PORT 已被占用"
   fi
-
-  if [ -z "$EMAIL" ]; then
-    reading "请输入邮箱（acme.sh 注册用，可留空）: " EMAIL ''
-  fi
-
-  [ -z "$WEBROOT" ] && WEBROOT=''
-
-  # ---------- DNS 检查 ----------
-  SERVER_IP=$(get_public_ip 2>/dev/null)
-  local resolved
-  resolved=$(resolve_domain "$DOMAIN")
-  if [ -z "$resolved" ]; then
-    warn "域名 ${DOMAIN} 暂无解析记录，ACME 验证可能失败"
-  elif [ -n "$SERVER_IP" ] && ! printf '%s\n' "$resolved" | tr ' ' '\n' | grep -qxF "$SERVER_IP"; then
-    warn "域名 ${DOMAIN} 解析到：${resolved}，本机公网 IP：${SERVER_IP}"
-    confirm "解析似乎不一致，仍要继续？" || { info "已取消"; exit 0; }
-  fi
-
-  # ---------- 端口检查 ----------
-  if port_in_use "$PORT"; then
-    warn "端口 ${PORT} 已被占用"
-    confirm "仍要继续安装？" || { info "已取消"; exit 0; }
-  fi
-
-  # ---------- 证书 ----------
-  issue_cert "$DOMAIN" "$WEBROOT"
-
-  # ---------- 内核 ----------
-  install_core "$CORE_VERSION"
-
-  # ---------- 配置与服务 ----------
-  write_config
-  save_env
-  write_service
-
-  svc_start
-  sleep 2
-  if svc_active; then
-    info "AnyTLS 服务已启动"
-  else
-    warn "服务未能正常启动，以下为最近的日志："
-    svc_log
-    exit 1
-  fi
-
-  show_info save
-  info "安装完成。管理菜单：bash anytls.sh"
-  info "卸载：bash anytls.sh uninstall"
-}
-
-# ==================== 各动作 ====================
-do_uninstall() {
-  need_root
-  detect_init
-  confirm "确认卸载 AnyTLS？将删除 ${WORK_DIR} 与服务" || { info "已取消"; exit 0; }
-
-  svc_stop
-  case "$INIT" in
-    systemd)
-      systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
-      rm -f "$SYSTEMD_FILE"
-      systemctl daemon-reload >/dev/null 2>&1
-      ;;
-    openrc)
-      rc-update del "$SERVICE_NAME" default >/dev/null 2>&1
-      rm -f "$OPENRC_FILE"
-      ;;
-  esac
-
-  # 删除 acme.sh 中的证书与续期任务
-  if [ -s "$ENV_FILE" ]; then
-    # shellcheck disable=SC1090
-    . "$ENV_FILE"
-    if [ -x "$ACME_BIN" ] && [ -n "$DOMAIN" ]; then
-      "$ACME_BIN" --remove -d "$DOMAIN" --ecc >/dev/null 2>&1 || true
-    fi
-  fi
-
-  rm -rf "$WORK_DIR"
-  info "卸载完成"
-}
-
-do_restart() {
-  need_root
-  load_env
-  detect_init
-  svc_restart
-  sleep 1
-  if svc_active; then info "服务已重启"; else warn "服务启动失败，日志如下："; svc_log; fi
-}
-
-do_update() {
-  need_root
-  detect_os
+  if [ -z "$PASSWORD" ]; then PASSWORD=$(openssl rand -hex 16) || error '生成密码失败'; fi
+  start_transaction "$BIN_FILE" "$CONF_FILE" "$ENV_FILE" "$KEY_FILE" "$CERT_FILE" "$INFO_FILE" "$MANAGER_FILE" "$WORK_DIR/version"
+  ensure_cron || warn '未确认 cron 正常运行，请检查定时任务服务，或用 menu renew 手动续期'
   detect_arch
-  detect_init
-  load_env
-  local old new
-  old=$(core_version)
-  info "当前内核版本：${old:-未知}"
-  install_core
-  new=$(core_version)
-  info "新内核版本：${new:-未知}"
-  svc_restart
-  sleep 1
-  if svc_active; then
-    info "内核更新完成，服务运行中"
-  else
-    warn "服务启动失败："
-    svc_log
+  prepare_core "${CORE_VERSION:-$DEFAULT_CORE_VERSION}"
+  prepare_manager "$TX/manage.sh" || error '无法准备本地管理脚本'
+  [ ! -L "$CERT_DIR" ] || error '证书目录不能是符号链接'
+  install_acme
+  backup_acme_conf
+  issue_cert "$old_port"
+  configure_cert
+  write_config "$TX/cert.pem" "$TX/private.key" > "$TX/check.json" && \
+    "$TX/sing-box" check -c "$TX/check.json" || error '候选配置校验失败'
+  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" && save_env > "$TX/anytls.env" && \
+    build_links > "$TX/anytls.txt" || error '无法写入安装配置'
+  publish_files "$BIN_FILE" "$CONF_FILE" "$ENV_FILE" "$KEY_FILE" "$CERT_FILE" "$INFO_FILE" "$MANAGER_FILE" "$WORK_DIR/version"
+  create_service || error '无法注册 AnyTLS 服务'
+  apply_service
+  install_menu || error '无法安装 menu 命令'
+  TX_COMMITTED=1
+  if [ -n "$old_domain" ] && [ "$old_domain" != "$DOMAIN" ]; then
+    acme --remove -d "$old_domain" --ecc || warn "旧域名 $old_domain 的续期记录需要手动清理"
   fi
-}
+  info '安装完成，输入 menu 打开管理菜单'
+  if [ "$NON_INTERACTIVE" = 0 ]; then cat "$INFO_FILE"; else info '连接凭据已保存，可用 menu info 查看'; fi
+)
 
-do_renew() {
+do_update() (
   need_root
-  load_env
+  require_install
   detect_os
-  detect_init
-  FORCE_RENEW='1'
-  issue_cert "$DOMAIN" "$WEBROOT"
-  svc_restart
-  sleep 1
-  if svc_active; then
-    info "证书已更新，服务已重启"
-  else
-    warn "服务启动失败："
-    svc_log
-  fi
-}
+  detect_init || error '需要 systemd 或 OpenRC'
+  check_deps
+  lock_work
+  require_install
+  start_transaction "$BIN_FILE" "$WORK_DIR/version"
+  detect_arch
+  prepare_core "$CORE_VERSION"
+  "$TX/sing-box" check -c "$CONF_FILE" || error '候选内核不兼容当前配置'
+  publish_files "$BIN_FILE" "$WORK_DIR/version"
+  apply_service
+  TX_COMMITTED=1
+  info "内核已更新至 $CORE_TAG"
+)
 
-do_change_port() {
+deploy_cert() (
+  local requested="$1"
   need_root
-  load_env
-  detect_init
-  local new
-  reading "请输入新端口: " new "$PORT"
-  valid_port "$new" || error "端口不合法：$new"
-  if [ "$new" = "$PORT" ]; then
-    info "端口未变化"
-    return 0
-  fi
-  if port_in_use "$new"; then
-    warn "端口 $new 已被占用"
-    confirm "仍要使用？" || return 0
-  fi
+  detect_init || error '需要 systemd 或 OpenRC'
+  lock_work
+  require_install
+  [ "$DOMAIN" = "$requested" ] || error '续期证书与当前 AnyTLS 域名不一致'
+  start_transaction "$KEY_FILE" "$CERT_FILE"
+  collect_cert "$(incoming_path "$DOMAIN")"
+  publish_files "$KEY_FILE" "$CERT_FILE"
+  "$BIN_FILE" check -c "$CONF_FILE" || error '续期证书配置校验失败'
+  # 保留操作员主动停止的状态。运行中的服务必须通过启动检查。
+  if [ "$TX_WAS_ACTIVE" = 1 ]; then apply_service; fi
+  TX_COMMITTED=1
+  info '续期证书已部署'
+)
 
-  PORT="$new"
-  write_config
-  save_env
-  svc_restart
-  sleep 1
-  if svc_active; then
-    info "端口已修改为 ${PORT}"
-    show_info save
-  else
-    warn "服务启动失败："
-    svc_log
-  fi
-}
-
-do_change_password() {
+do_renew() (
   need_root
-  load_env
-  detect_init
-  local new
-  reading "请输入新密码（留空自动生成）: " new ''
-  if [ -z "$new" ]; then
-    new=$(gen_password)
-    info "已生成新密码：${new}"
-  fi
-  valid_password "$new" || error "密码只能包含字母数字和 ._~- ，长度 6-64"
+  detect_init || error '需要 systemd 或 OpenRC'
+  lock_work
+  require_install
+  [ -x "$MANAGER_FILE" ] || error '请先用新版脚本重装以安装本地管理入口'
+  start_transaction "$CERT_FILE" "$KEY_FILE"
+  backup_acme_conf
+  issue_cert "$PORT"
+  configure_cert
+  publish_files "$CERT_FILE" "$KEY_FILE"
+  "$BIN_FILE" check -c "$CONF_FILE" || error '续期证书配置校验失败'
+  if [ "$TX_WAS_ACTIVE" = 1 ]; then apply_service; fi
+  TX_COMMITTED=1
+  info '证书已更新'
+)
 
-  PASSWORD="$new"
-  write_config
-  save_env
-  svc_restart
-  sleep 1
-  if svc_active; then
-    info "密码已更新"
-    show_info save
+change_config() (
+  local kind="$1" new
+  need_root
+  detect_init || error '需要 systemd 或 OpenRC'
+  lock_work
+  require_install
+  if [ "$kind" = port ]; then
+    reading '新端口: ' new "$PORT"
+    valid_port "$new" || error '端口不合法'
+    if [ "$PORT" = "$new" ]; then info '端口未变化'; exit 0; fi
+    if port_in_use "$new"; then error "端口 $new 已被占用"; fi
+    PORT="$new"
   else
-    warn "服务启动失败："
-    svc_log
+    reading '新密码（留空自动生成）: ' new ''
+    if [ -z "$new" ]; then new=$(openssl rand -hex 16) || error '生成密码失败'; fi
+    valid_password "$new" || error '密码应为 6 至 64 位 URL 安全字符'
+    PASSWORD="$new"
   fi
-}
+  start_transaction "$CONF_FILE" "$ENV_FILE" "$INFO_FILE"
+  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" && save_env > "$TX/anytls.env" && \
+    build_links > "$TX/anytls.txt" || error '无法保存候选配置'
+  "$BIN_FILE" check -c "$TX/config.json" || error '候选配置校验失败'
+  publish_files "$CONF_FILE" "$ENV_FILE" "$INFO_FILE"
+  apply_service
+  TX_COMMITTED=1
+  cat "$INFO_FILE"
+)
+
+do_restart() (
+  need_root
+  detect_init || error '需要 systemd 或 OpenRC'
+  lock_work
+  require_install
+  if ! svc_restart || ! service_ready; then svc_log >&2 || true; error '重启失败'; fi
+  info '服务已重启'
+)
+
+do_uninstall() (
+  need_root
+  detect_init || error '需要 systemd 或 OpenRC'
+  lock_work
+  if [ "$FORCE_INSTALL" = 0 ]; then confirm '确认卸载 AnyTLS 并删除其本地配置？' || exit 2; fi
+  if [ -f "$UNIT_FILE" ]; then
+    is_installed || error '无法确认该服务属于当前安装，请检查本地配置'
+    svc_stop || error '停止 AnyTLS 失败'
+    remove_service || error '删除 AnyTLS 服务注册失败'
+  fi
+  if [ -x "$ACME_BIN" ] && load_env; then
+    acme --remove -d "$DOMAIN" --ecc || warn "请手动清理域名 $DOMAIN 的续期记录"
+  fi
+  remove_menu && rm -rf -- "$WORK_DIR" || error '无法删除所有 AnyTLS 文件'
+  info '已卸载 AnyTLS'
+)
 
 do_status() {
-  detect_init
-  if is_installed; then
-    local v
-    v=$(core_version)
-    load_env
-    printf '安装状态: %s已安装%s\n' "$GREEN" "$PLAIN"
-    printf '内核版本: %s\n' "${v:-未知}"
-    printf '域名    : %s\n' "${DOMAIN}"
-    printf '监听端口: %s\n' "${PORT}"
-    printf '服务状态: %s\n' "$(svc_active && printf '%s运行中%s' "$GREEN" "$PLAIN" || printf '%s未运行%s' "$RED" "$PLAIN")"
-  else
-    printf '安装状态: %s未安装%s\n' "$YELLOW" "$PLAIN"
-    return 1
-  fi
+  local state=未运行
+  require_install
+  if detect_init && svc_active; then state=运行中; fi
+  printf '域名: %s\n端口: %s\n内核: %s\n服务: %s\n' "$DOMAIN" "$PORT" "$(core_version)" "$state"
+  [ "$state" = 运行中 ]
 }
 
-menu() {
+do_info() { need_root; require_install; build_links; }
+
+do_menu() {
   need_root
-  detect_init
+  require_install
+  local choice
   while :; do
-    clear 2>/dev/null || true
-    printf '%s\n' "${BLUE}================================================================${PLAIN}"
-    info "  AnyTLS 管理菜单"
-    printf '%s\n' "${BLUE}================================================================${PLAIN}"
-    ( do_status ) 2>/dev/null || true
-    printf '%s\n' "${BLUE}================================================================${PLAIN}"
-    printf '  1. 查看节点信息 / 分享链接\n'
-    printf '  2. 修改端口\n'
-    printf '  3. 修改密码\n'
-    printf '  4. 重新申请证书（ACME）\n'
-    printf '  5. 更新 sing-box 内核\n'
-    printf '  6. 重启服务\n'
-    printf '  7. 查看日志\n'
-    printf '  8. 卸载\n'
-    printf '  0. 退出\n'
-    printf '%s\n' "${BLUE}================================================================${PLAIN}"
-    local choose
-    reading "请选择: " choose ''
-    case "$choose" in
-      1) show_info save ;;
-      2) do_change_port ;;
-      3) do_change_password ;;
-      4) do_renew ;;
+    info '========== AnyTLS 管理菜单 =========='
+    (do_status) || true
+    printf '%s\n' '1. 节点信息' '2. 修改端口' '3. 修改密码' '4. 重签证书' \
+      '5. 更新内核' '6. 重启服务' '7. 查看日志' '8. 卸载' '0. 退出'
+    reading '请选择: ' choice ''
+    case "$choice" in
+      1) (do_info) ;;
+      2) change_config port ;;
+      3) change_config password ;;
+      4) (ACTION=renew; do_renew) ;;
       5) do_update ;;
       6) do_restart ;;
-      7) svc_log ;;
-      8) do_uninstall; exit 0 ;;
-      0|'') exit 0 ;;
-      *) warn "无效选项：$choose" ;;
+      7) (detect_init && svc_log) ;;
+      8) if do_uninstall; then return 0; fi ;;
+      0|'') return 0 ;;
+      *) warn '无效选项' ;;
     esac
-    printf '\n'
-    reading "按回车返回菜单..." _ignore ''
+    reading '按回车返回菜单: ' choice ''
   done
 }
 
 usage() {
   cat <<'EOF'
-AnyTLS 一键安装与管理脚本（sing-box 内核 + acme.sh 证书）
+AnyTLS 安装和管理
 
-用法:
   bash anytls.sh [命令] [选项]
+  menu [命令] [选项]
 
-命令:
-  install     安装 / 重装
-  menu        管理菜单（默认：已安装进入菜单，未安装进入安装）
-  info        输出节点信息与分享链接
-  status      查看安装与运行状态
-  restart     重启服务
-  update      更新 sing-box 内核
-  renew       重新申请证书
-  uninstall   卸载
-  help        显示本帮助
+命令
+  install  安装或重装
+  menu     打开管理菜单
+  info     查看节点凭据和分享链接
+  status   查询服务状态
+  restart  重启服务
+  update   更新 sing-box，可用 --version 指定版本
+  renew    手动重签证书
+  uninstall 卸载，--force 跳过确认
 
-安装选项:
-  --domain <域名>      证书域名（必填，需已解析到本机）
-  --port <端口>        监听端口，默认 8443
-  --password <密码>    AnyTLS 密码，默认随机生成（URL 安全字符）
-  --name <节点名>      节点显示名称，默认 AnyTLS-<域名>
-  --email <邮箱>       acme.sh 注册邮箱（可留空）
-  --webroot <目录>     使用 webroot 方式验证（默认自动 standalone/alpn）
-  --version <版本>     指定 sing-box 版本，如 1.12.0
-  --force             已安装时强制重装
-
-示例:
-  bash anytls.sh install --domain tls.example.com --port 8443 --email me@example.com
-  bash anytls.sh install --domain tls.example.com --webroot /var/www/html
-
-远程一键安装:
-  bash <(curl -Ls https://raw.githubusercontent.com/Howl-Star/anytls/main/anytls.sh)
+安装选项
+  --domain <域名>      证书域名
+  --port <端口>        默认 8443
+  --password <密码>    默认随机生成
+  --name <节点名>      默认 AnyTLS-<域名>
+  --email <邮箱>       可选的 ACME 邮箱
+  --webroot <目录>     已有站点的 webroot
+  --version <版本>     覆盖安装脚本固定的默认内核版本
+  --force             确认重装
+  --non-interactive   使用默认值并禁止读取输入
 EOF
 }
 
-# ==================== 参数解析 ====================
-ACTION=''
-DOMAIN=''; PORT=''; PASSWORD=''; NODE_NAME=''; EMAIL=''; WEBROOT=''; CORE_VERSION=''
-FORCE_INSTALL='0'; FORCE_RENEW='0'; SERVER_IP=''
+parse_args() {
+  case "${1:-}" in
+    install|menu|info|status|restart|update|renew|uninstall|help|-h|--help|deploy-cert)
+      ACTION="$1"; shift ;;
+  esac
+  if [ "$ACTION" = deploy-cert ]; then
+    [ "$#" = 1 ] && valid_domain "$1" || error '缺少有效的续期域名'
+    DEPLOY_DOMAIN="$1"
+    return 0
+  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force)
+        [[ "$ACTION" == install || "$ACTION" == uninstall || -z "$ACTION" ]] || error "$ACTION 不支持 $1"
+        FORCE_INSTALL=1; shift ;;
+      --non-interactive)
+        [[ "$ACTION" == install || "$ACTION" == uninstall || -z "$ACTION" ]] || error "$ACTION 不支持 $1"
+        NON_INTERACTIVE=1; shift ;;
+      --domain|--port|--password|--name|--email|--webroot|--version)
+        if [[ -n "$ACTION" && "$ACTION" != install && ! ( "$ACTION" = update && "$1" = --version ) ]]; then
+          error "$ACTION 不支持 $1"
+        fi
+        [[ "$#" -ge 2 && "$2" != --* ]] || error "$1 缺少取值"
+        case "$1" in
+          --domain) DOMAIN="$2" ;;
+          --port) PORT="$2" ;;
+          --password) PASSWORD="$2" ;;
+          --name) NODE_NAME="$2" ;;
+          --email) EMAIL="$2" ;;
+          --webroot) WEBROOT="$2" ;;
+          --version) CORE_VERSION="$2" ;;
+        esac
+        INSTALL_OPTIONS=1
+        shift 2 ;;
+      *) error "未知参数 $1，请查看 help" ;;
+    esac
+  done
+}
 
-# 取选项值：缺值时报错，避免 `--domain` 结尾把下一个参数吞掉或变成死循环
-need_value() {
-  [ "$2" -ge 2 ] || error "选项 $1 缺少取值（bash $0 help 查看用法）"
-  # 下一个参数若是另一个选项，说明本选项漏了取值（如 --domain --port 443）
-  case "$3" in
-    -*) error "选项 $1 缺少取值，其后直接跟了选项 $3（bash $0 help 查看用法）" ;;
+main() {
+  set -o pipefail
+  umask 077
+  init_paths
+  SCRIPT_SOURCE=${BASH_SOURCE[0]}
+  ACTION='' DOMAIN='' PORT='' PASSWORD='' NODE_NAME='' EMAIL='' WEBROOT='' CORE_VERSION=''
+  FORCE_INSTALL=0 NON_INTERACTIVE=0 INSTALL_OPTIONS=0 DEPLOY_DOMAIN=''
+  if [ "${0##*/}" = menu ]; then
+    case "${1:-}" in ''|--force|--non-interactive|--domain|--port|--password|--name|--email|--webroot|--version) ACTION=menu ;; esac
+  fi
+  parse_args "$@"
+  if [ -z "$ACTION" ]; then
+    if [ "${0##*/}" = menu ]; then ACTION=menu
+    elif [ "$INSTALL_OPTIONS" = 1 ] || [ "$FORCE_INSTALL" = 1 ] || [ "$NON_INTERACTIVE" = 1 ] || ! is_installed; then ACTION=install
+    else ACTION=menu; fi
+  fi
+  case "$ACTION" in
+    install) do_install ;;
+    menu) do_menu ;;
+    info) do_info ;;
+    status) do_status ;;
+    restart) do_restart ;;
+    update) do_update ;;
+    renew) do_renew ;;
+    uninstall) do_uninstall ;;
+    deploy-cert) deploy_cert "$DEPLOY_DOMAIN" ;;
+    help|-h|--help) usage ;;
   esac
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    install|menu|info|status|restart|update|renew|uninstall|help|-h|--help)
-      ACTION="$1"
-      shift
-      ;;
-    --domain)   need_value "$1" $# "$2"; DOMAIN="$2"; shift 2 ;;
-    --port)     need_value "$1" $# "$2"; PORT="$2"; shift 2 ;;
-    --password) need_value "$1" $# "$2"; PASSWORD="$2"; shift 2 ;;
-    --name)     need_value "$1" $# "$2"; NODE_NAME="$2"; shift 2 ;;
-    --email)    need_value "$1" $# "$2"; EMAIL="$2"; shift 2 ;;
-    --webroot)  need_value "$1" $# "$2"; WEBROOT="$2"; shift 2 ;;
-    --version)  need_value "$1" $# "$2"; CORE_VERSION="$2"; shift 2 ;;
-    --force)    FORCE_INSTALL='1'; shift ;;
-    *)
-      warn "未知参数：$1"
-      shift
-      ;;
-  esac
-done
-
-# 仅在直接执行时进入主流程：被 source（如测试、二次封装）时只加载函数定义，
-# 避免末尾的 exit 把调用方 shell 一起退出
-if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
-  case "$ACTION" in
-    install)   do_install ;;
-    info)      show_info save ;;
-    status)    do_status ;;
-    restart)   do_restart ;;
-    update)    do_update ;;
-    renew)     do_renew ;;
-    uninstall) do_uninstall ;;
-    help|-h|--help) usage ;;
-    menu)      menu ;;
-    '')
-      if is_installed; then
-        menu
-      else
-        do_install
-      fi
-      ;;
-    *) usage; exit 1 ;;
-  esac
-  exit 0
-fi
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then main "$@"; fi
