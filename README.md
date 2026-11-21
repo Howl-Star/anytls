@@ -22,7 +22,7 @@ menu renew
 menu uninstall
 ```
 
-已有旧版安装的机器需要用新版 `anytls.sh` 执行一次重装，才能创建 `menu` 并更新续期设置。重装会根据本次参数重建配置。要保留原端口、密码和 webroot，请在重装时传入原值。执行 `menu info` 会显示密码和分享链接，复制时请妥善保管。
+旧版升级运行 `sudo bash anytls.sh upgrade`。脚本会保留域名、端口、密码、webroot 和在线证书，安装 `menu`，并更新现有 acme.sh 的续期部署设置。未创建 `menu` 的旧安装也可以直接运行 `sudo bash anytls.sh` 进入升级流程。执行 `menu info` 会显示密码和分享链接，复制时请妥善保管。
 
 ## 安装条件
 
@@ -56,9 +56,14 @@ sudo bash anytls.sh install --non-interactive --domain tls.example.com --webroot
 ## 更新和续期
 
 - 更新从 sing-box 的 GitHub Release 下载对应架构的二进制文件，校验 Release 提供的 SHA-256，检查现有配置，然后重启服务。启动检查失败时恢复旧文件，并尝试恢复原服务状态。
-- acme.sh 的 cron 任务续期后，将证书交给本地管理脚本检查和部署。服务重启失败会返回错误并保留原证书。未确认 cron 正常运行时，安装会提示检查。需要立即重签时运行 `menu renew`。
+- 指定 `--webroot` 时只尝试该站点验证。未指定时优先使用 `80/TCP` 的 HTTP 验证。若端口被占用，或 CA 返回可识别的 HTTP 连通性错误，则尝试 `443/TCP` 的 TLS-ALPN 验证。DNS、限流和其他无法识别的错误会保留 ACME 日志并停止回退。
+- acme.sh 的 cron 任务续期后，将证书交给本地管理脚本检查和部署。`menu renew` 优先重试部署有效的候选证书。需要重新签发时，会优先沿用已记录的 TLS-ALPN 或配置的 webroot。未确认 cron 正常运行时，安装会提示检查。
 - 如果 AnyTLS 使用 `80` 或 `443`，请确保续期时所选的验证端口可用。可用独立 HTTP 站点提供 `--webroot`，或使用 `menu renew` 手动重签。
 - sing-box 的架构和 musl 资产由对应 Release 决定。资产缺失或缺少校验值时，脚本会停止并指出文件名。
+
+## 卸载
+
+运行 `sudo menu uninstall`，或在管理菜单中选择「卸载」。确认后先取消当前域名的自动续期，再移除服务、本地配置和本项目的 `menu` 入口。共享的 acme.sh、其他域名证书和 acme.sh 中的证书原件会保留。若续期记录清理失败，修复后可重新运行卸载。自动化可用 `sudo menu uninstall --force` 跳过确认。
 
 ## 文件位置
 

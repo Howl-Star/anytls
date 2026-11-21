@@ -191,9 +191,11 @@ is_installed() { [ -s "$ENV_FILE" ] && [ -x "$BIN_FILE" ]; }
 require_install() { load_env || error '未安装 AnyTLS，或安装配置无法读取'; }
 
 lock_work() {
+  local -a lock_options=(-n)
+  if [ "$#" -gt 0 ]; then lock_options=(-w "$1"); fi
   command -v flock >/dev/null || error '需要 flock，请安装 util-linux 或运行新版安装脚本补齐依赖'
   exec 9>"$LOCK_FILE" || error "无法打开锁文件 $LOCK_FILE"
-  flock -n 9 || error '有另一个 AnyTLS 操作正在运行，请稍后再试'
+  flock "${lock_options[@]}" 9 || error '有另一个 AnyTLS 操作正在运行，请稍后再试'
 }
 
 # 每次写入在同一文件系统上准备候选文件，旧内容保留至服务检查通过。
@@ -418,8 +420,8 @@ prepare_manager() {
       printf '#!/usr/bin/env bash\n'
       declare -f
       # The generated launcher expands these variables at runtime.
-    # shellcheck disable=SC2016
-    printf '\nif [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi\n'
+      # shellcheck disable=SC2016
+      printf '\nif [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi\n'
     } > "$dest" && chmod 755 "$dest" || return 1
   fi
   bash -n "$dest"
@@ -447,10 +449,16 @@ install_acme() {
 
 acme() { "$ACME_BIN" --home "$ACME_HOME" "$@"; }
 
-backup_acme_conf() {
+acme_conf_path() {
   local conf
   conf=$(acme --info -d "$DOMAIN" --ecc 2>/dev/null | sed -n 's/^DOMAIN_CONF=//p')
-  [[ "$conf" == /*/"$DOMAIN.conf" && "$conf" != *$'\n'* ]] || error 'acme.sh 未返回可用的域名配置路径'
+  [[ "$conf" == /*/"$DOMAIN.conf" && "$conf" != *$'\n'* ]] || return 1
+  printf '%s\n' "$conf"
+}
+
+backup_acme_conf() {
+  local conf
+  conf=$(acme_conf_path) || error 'acme.sh 未返回可用的域名配置路径'
   if [ -e "$conf" ]; then
     [ -f "$conf" ] && [ ! -L "$conf" ] || error '无法备份此 acme.sh 域名配置'
     cp -p -- "$conf" "$TX/old/acme-domain.conf" || error '备份 acme.sh 域名配置失败'
@@ -468,20 +476,32 @@ restore_acme_conf() {
 
 try_issue() {
   local rc=0
-  acme --issue --server letsencrypt -d "$DOMAIN" --keylength ec-256 "${ISSUE_ARGS[@]}" "$@" || rc=$?
+  acme --issue --server letsencrypt -d "$DOMAIN" --keylength ec-256 "${ISSUE_ARGS[@]}" "$@" 2>&1 | tee "$TX/acme-issue.log" >&2 || rc=$?
   [ "$rc" = 0 ] || [ "$rc" = 2 ]
 }
 
 issue_cert() {
-  local old_port="$1"
+  local old_port="$1" previous_mode=''
   local -a ISSUE_ARGS=()
   if [ -n "$EMAIL" ]; then ISSUE_ARGS+=(--accountemail "$EMAIL"); fi
   if [ "$ACTION" = renew ] || [ "${FORCE_ISSUE:-0}" = 1 ]; then ISSUE_ARGS+=(--force); fi
   if [ -n "$WEBROOT" ]; then
+    info "使用 webroot 验证（$WEBROOT）"
     try_issue -w "$WEBROOT" || error 'webroot 验证失败，请检查站点路径和 80/TCP'
     return 0
   fi
-  if ! port_in_use 80 && try_issue --standalone --httpport 80; then return 0; fi
+  if [ "$ACTION" = renew ]; then
+    previous_mode=$(acme --info -d "$DOMAIN" --ecc 2>/dev/null | sed -n 's/^Le_Webroot=//p')
+  fi
+  if [ "$previous_mode" != alpn ] && ! port_in_use 80; then
+    info '使用 80/TCP 进行 HTTP 验证'
+    if try_issue --standalone --httpport 80; then return 0; fi
+    # Only fall back on a recognizable HTTP validation or bind failure.
+    if grep -Eiq 'NXDOMAIN|SERVFAIL|rate.?limit|too many (requests|certificates|failed authorizations)|CAA' "$TX/acme-issue.log" ||
+      ! grep -Eiq 'Timeout during connect|Connection refused|Invalid response from|Address already in use' "$TX/acme-issue.log"; then
+      error 'HTTP 签发失败，请检查上方 ACME 日志'
+    fi
+  fi
   if port_in_use 443; then
     if [ "$old_port" != 443 ] || [ "$TX_WAS_ACTIVE" != 1 ]; then
       error '443/TCP 已被占用，请使用 --webroot 或释放验证端口'
@@ -490,6 +510,7 @@ issue_cert() {
     svc_stop || error '临时停止 AnyTLS 失败'
     if port_in_use 443; then error '443/TCP 仍被占用，请使用 --webroot'; fi
   fi
+  info '使用 443/TCP 进行 TLS-ALPN 验证'
   try_issue --alpn --tlsport 443 || error 'ACME 签发失败，请检查域名解析、80/443 和防火墙'
 }
 
@@ -613,7 +634,7 @@ do_install() (
   [ ! -L "$CERT_DIR" ] || error '证书目录不能是符号链接'
   install_acme
   backup_acme_conf
-  issue_cert "$old_port"
+  ANYTLS_DEFER_DEPLOY=1 issue_cert "$old_port"
   configure_cert
   write_config "$TX/cert.pem" "$TX/private.key" > "$TX/check.json" || error '无法生成候选配置'
   "$TX/sing-box" check -c "$TX/check.json" || error '候选配置校验失败'
@@ -630,6 +651,29 @@ do_install() (
   fi
   info '安装完成，输入 menu 打开管理菜单'
   if [ "$NON_INTERACTIVE" = 0 ]; then cat "$INFO_FILE"; else info '连接凭据已保存，可用 menu info 查看'; fi
+)
+
+do_upgrade() (
+  need_root
+  detect_init || error '需要 systemd 或 OpenRC'
+  is_installed || error '未找到可升级的 AnyTLS 内核'
+  detect_os
+  check_deps
+  lock_work
+  require_install
+  is_installed || error '未找到可升级的 AnyTLS 内核'
+  menu_available || error "$MENU_FILE 已被其他程序使用"
+  [ -x "$ACME_BIN" ] || error '未找到原安装使用的 acme.sh'
+  start_transaction "$MANAGER_FILE"
+  prepare_manager "$TX/manage.sh" || error '无法准备本地管理脚本'
+  collect_cert "$CERT_DIR"
+  backup_acme_conf
+  [ -f "$TX_ACME_CONF" ] || error '未找到该域名的续期记录，请检查 acme.sh 配置'
+  configure_cert
+  publish_files "$MANAGER_FILE"
+  install_menu || error '无法安装 menu 命令'
+  TX_COMMITTED=1
+  info '升级完成，输入 menu 打开管理菜单'
 )
 
 do_update() (
@@ -654,7 +698,7 @@ deploy_cert() (
   local requested="$1"
   need_root
   detect_init || error '需要 systemd 或 OpenRC'
-  lock_work
+  lock_work 30
   require_install
   [ "$DOMAIN" = "$requested" ] || error '续期证书与当前 AnyTLS 域名不一致'
   start_transaction "$KEY_FILE" "$CERT_FILE"
@@ -668,15 +712,26 @@ deploy_cert() (
 )
 
 do_renew() (
+  local ACTION=renew
   need_root
   detect_init || error '需要 systemd 或 OpenRC'
   lock_work
   require_install
-  [ -x "$MANAGER_FILE" ] || error '请先用新版脚本重装以安装本地管理入口'
+  [ -x "$MANAGER_FILE" ] || error '请先运行 bash anytls.sh upgrade 安装管理入口'
   start_transaction "$CERT_FILE" "$KEY_FILE"
-  backup_acme_conf
-  issue_cert "$PORT"
-  configure_cert
+  local inbox
+  inbox=$(incoming_path "$DOMAIN")
+  if [ -s "$inbox/cert.pem" ] && [ -s "$inbox/private.key" ] &&
+    ! cmp -s -- "$inbox/cert.pem" "$CERT_FILE" &&
+    (collect_cert "$inbox"); then
+    info '重试部署已签发的证书'
+  else
+    backup_acme_conf
+    ANYTLS_DEFER_DEPLOY=1 issue_cert "$PORT"
+    configure_cert
+    # Keep the successful issuance and its renewal settings if service activation fails.
+    TX_ACME_CONF=''
+  fi
   publish_files "$CERT_FILE" "$KEY_FILE"
   "$BIN_FILE" check -c "$CONF_FILE" || error '续期证书配置校验失败'
   if [ "$TX_WAS_ACTIVE" = 1 ]; then apply_service; fi
@@ -728,14 +783,30 @@ do_uninstall() (
   need_root
   detect_init || error '需要 systemd 或 OpenRC'
   lock_work
-  if [ "$FORCE_INSTALL" = 0 ]; then confirm '确认卸载 AnyTLS 并删除其本地配置？' || exit 2; fi
-  if [ -f "$UNIT_FILE" ]; then
-    is_installed || error '无法确认该服务属于当前安装，请检查本地配置'
-    svc_stop || error '停止 AnyTLS 失败'
-    remove_service || error '删除 AnyTLS 服务注册失败'
+  if [ ! -e "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ] && [ ! -e "$UNIT_FILE" ] && [ ! -L "$UNIT_FILE" ] && ! owns_menu; then
+    info 'AnyTLS 已卸载'
+    exit 0
   fi
-  if [ -x "$ACME_BIN" ] && load_env; then
-    acme --remove -d "$DOMAIN" --ecc || warn "请手动清理域名 $DOMAIN 的续期记录"
+  [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ] || error '无法确认 AnyTLS 安装目录'
+  is_installed || error '无法确认本地文件属于 AnyTLS，请检查安装目录'
+  require_install
+  [ ! -L "$UNIT_FILE" ] || error '服务文件是符号链接，请先确认其归属'
+  if [ "$FORCE_INSTALL" = 0 ]; then
+    info "将删除 AnyTLS 服务、$WORK_DIR 和本项目的 menu 入口，并取消 $DOMAIN 的自动续期。"
+    confirm '确认卸载 AnyTLS？' || exit 2
+  fi
+  local conf
+  if [ -x "$ACME_BIN" ]; then
+    conf=$(acme_conf_path) || error '无法确认续期记录位置，卸载未完成'
+    if [ -e "$conf" ]; then
+      acme --remove -d "$DOMAIN" --ecc || error '无法清理续期记录，卸载未完成，可重新运行 menu uninstall'
+    fi
+  elif [ -d "$ACME_HOME" ]; then
+    error '找不到 acme.sh，请恢复后重试卸载'
+  fi
+  if [ -f "$UNIT_FILE" ]; then
+    if svc_active; then svc_stop || error '停止 AnyTLS 失败'; fi
+    remove_service || error '删除 AnyTLS 服务注册失败'
   fi
   remove_menu || error '无法移除 menu 入口'
   rm -rf -- "$WORK_DIR" || error '无法删除所有 AnyTLS 文件'
@@ -761,14 +832,14 @@ do_menu() {
   while :; do
     info '========== AnyTLS 管理菜单 =========='
     (do_status) || true
-    printf '%s\n' '1. 节点信息' '2. 修改端口' '3. 修改密码' '4. 重签证书' \
+    printf '%s\n' '1. 节点信息' '2. 修改端口' '3. 修改密码' '4. 续期证书' \
       '5. 更新内核' '6. 重启服务' '7. 查看日志' '8. 卸载' '0. 退出'
     reading '请选择: ' choice ''
     case "$choice" in
       1) (do_info) ;;
       2) change_config port ;;
       3) change_config password ;;
-      4) (ACTION=renew; do_renew) ;;
+      4) do_renew ;;
       5) do_update ;;
       6) do_restart ;;
       7) (detect_init && svc_log) ;;
@@ -789,12 +860,13 @@ AnyTLS 安装和管理
 
 命令
   install  安装或重装
+  upgrade 保留配置并安装新版管理入口
   menu     打开管理菜单
   info     查看节点凭据和分享链接
   status   查询服务状态
   restart  重启服务
   update   更新 sing-box，可用 --version 指定版本
-  renew    手动重签证书
+  renew    续期或重试部署证书
   uninstall 卸载，--force 跳过确认
 
 安装选项
@@ -812,7 +884,7 @@ EOF
 
 parse_args() {
   case "${1:-}" in
-    install|menu|info|status|restart|update|renew|uninstall|help|-h|--help|deploy-cert)
+    install|upgrade|menu|info|status|restart|update|renew|uninstall|help|-h|--help|deploy-cert)
       ACTION="$1"; shift ;;
   esac
   if [ "$ACTION" = deploy-cert ]; then
@@ -864,10 +936,12 @@ main() {
   if [ -z "$ACTION" ]; then
     if [ "${0##*/}" = menu ]; then ACTION=menu
     elif [ "$INSTALL_OPTIONS" = 1 ] || [ "$FORCE_INSTALL" = 1 ] || [ "$NON_INTERACTIVE" = 1 ] || ! is_installed; then ACTION=install
+    elif ! owns_menu; then ACTION=upgrade
     else ACTION=menu; fi
   fi
   case "$ACTION" in
     install) do_install ;;
+    upgrade) do_upgrade ;;
     menu) do_menu ;;
     info) do_info ;;
     status) do_status ;;
