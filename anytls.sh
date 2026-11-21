@@ -200,7 +200,8 @@ lock_work() {
 start_transaction() {
   local target
   mkdir -p "$WORK_DIR" || error "无法创建 $WORK_DIR"
-  [ ! -L "$WORK_DIR" ] && chmod 700 "$WORK_DIR" || error "无法保护 $WORK_DIR"
+  [ ! -L "$WORK_DIR" ] || error "无法保护 $WORK_DIR"
+  chmod 700 "$WORK_DIR" || error "无法保护 $WORK_DIR"
   TX=$(mktemp -d "$WORK_DIR/.txn.XXXXXXXX") || error '无法创建事务目录'
   TX_TARGETS=("$@")
   TX_CHANGED=0 TX_COMMITTED=0 TX_WAS_ACTIVE=0 TX_SERVICE_CREATED=0 TX_MENU_CREATED=0 TX_RESTART=0
@@ -283,7 +284,8 @@ prepare_core() {
   fetch "$url" "$TX/core.tar.gz" || error '内核下载失败'
   (cd "$TX" && printf '%s  core.tar.gz\n' "${digest#sha256:}" | sha256sum -c -) || error '内核 SHA-256 校验失败'
   tar -xOzf "$TX/core.tar.gz" "${name%.tar.gz}/sing-box" > "$TX/sing-box" || error '无法提取 sing-box'
-  chmod 755 "$TX/sing-box" && "$TX/sing-box" version >/dev/null || error '候选内核无法运行'
+  chmod 755 "$TX/sing-box" || error '无法设置候选内核权限'
+  "$TX/sing-box" version >/dev/null || error '候选内核无法运行'
   printf '%s\n' "${CORE_TAG#v}" > "$TX/version" || error '无法保存版本号'
 }
 
@@ -415,7 +417,9 @@ prepare_manager() {
     {
       printf '#!/usr/bin/env bash\n'
       declare -f
-      printf '\nif [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi\n'
+      # The generated launcher expands these variables at runtime.
+    # shellcheck disable=SC2016
+    printf '\nif [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi\n'
     } > "$dest" && chmod 755 "$dest" || return 1
   fi
   bash -n "$dest"
@@ -500,7 +504,8 @@ collect_cert() {
   cert_pub=$(openssl x509 -in "$inbox/cert.pem" -noout -pubkey) || error '无法读取证书公钥'
   key_pub=$(openssl pkey -in "$inbox/private.key" -pubout) || error '无法读取私钥'
   [ "$cert_pub" = "$key_pub" ] || error '证书与私钥不匹配'
-  install -m 600 -- "$inbox/private.key" "$TX/private.key" && install -m 644 -- "$inbox/cert.pem" "$TX/cert.pem" || error '无法准备证书文件'
+  install -m 600 -- "$inbox/private.key" "$TX/private.key" || error '无法准备私钥文件'
+  install -m 644 -- "$inbox/cert.pem" "$TX/cert.pem" || error '无法准备证书文件'
 }
 
 configure_cert() {
@@ -610,10 +615,11 @@ do_install() (
   backup_acme_conf
   issue_cert "$old_port"
   configure_cert
-  write_config "$TX/cert.pem" "$TX/private.key" > "$TX/check.json" && \
-    "$TX/sing-box" check -c "$TX/check.json" || error '候选配置校验失败'
-  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" && save_env > "$TX/anytls.env" && \
-    build_links > "$TX/anytls.txt" || error '无法写入安装配置'
+  write_config "$TX/cert.pem" "$TX/private.key" > "$TX/check.json" || error '无法生成候选配置'
+  "$TX/sing-box" check -c "$TX/check.json" || error '候选配置校验失败'
+  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" || error '无法生成服务配置'
+  save_env > "$TX/anytls.env" || error '无法保存安装参数'
+  build_links > "$TX/anytls.txt" || error '无法写入安装配置'
   publish_files "$BIN_FILE" "$CONF_FILE" "$ENV_FILE" "$KEY_FILE" "$CERT_FILE" "$INFO_FILE" "$MANAGER_FILE" "$WORK_DIR/version"
   create_service || error '无法注册 AnyTLS 服务'
   apply_service
@@ -689,7 +695,7 @@ change_config() (
     valid_port "$new" || error '端口不合法'
     if [ "$PORT" = "$new" ]; then info '端口未变化'; exit 0; fi
     if port_in_use "$new"; then error "端口 $new 已被占用"; fi
-    PORT="$new"
+    local PORT="$new"
   else
     reading '新密码（留空自动生成）: ' new ''
     if [ -z "$new" ]; then new=$(openssl rand -hex 16) || error '生成密码失败'; fi
@@ -697,8 +703,9 @@ change_config() (
     PASSWORD="$new"
   fi
   start_transaction "$CONF_FILE" "$ENV_FILE" "$INFO_FILE"
-  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" && save_env > "$TX/anytls.env" && \
-    build_links > "$TX/anytls.txt" || error '无法保存候选配置'
+  write_config "$CERT_FILE" "$KEY_FILE" > "$TX/config.json" || error '无法生成服务配置'
+  save_env > "$TX/anytls.env" || error '无法保存安装参数'
+  build_links > "$TX/anytls.txt" || error '无法保存候选配置'
   "$BIN_FILE" check -c "$TX/config.json" || error '候选配置校验失败'
   publish_files "$CONF_FILE" "$ENV_FILE" "$INFO_FILE"
   apply_service
@@ -728,7 +735,8 @@ do_uninstall() (
   if [ -x "$ACME_BIN" ] && load_env; then
     acme --remove -d "$DOMAIN" --ecc || warn "请手动清理域名 $DOMAIN 的续期记录"
   fi
-  remove_menu && rm -rf -- "$WORK_DIR" || error '无法删除所有 AnyTLS 文件'
+  remove_menu || error '无法移除 menu 入口'
+  rm -rf -- "$WORK_DIR" || error '无法删除所有 AnyTLS 文件'
   info '已卸载 AnyTLS'
 )
 
@@ -804,7 +812,8 @@ parse_args() {
       ACTION="$1"; shift ;;
   esac
   if [ "$ACTION" = deploy-cert ]; then
-    [ "$#" = 1 ] && valid_domain "$1" || error '缺少有效的续期域名'
+    [[ "$#" = 1 ]] || error '缺少有效的续期域名'
+    valid_domain "$1" || error '缺少有效的续期域名'
     DEPLOY_DOMAIN="$1"
     return 0
   fi
