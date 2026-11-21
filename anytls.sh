@@ -695,7 +695,9 @@ change_config() (
     valid_port "$new" || error '端口不合法'
     if [ "$PORT" = "$new" ]; then info '端口未变化'; exit 0; fi
     if port_in_use "$new"; then error "端口 $new 已被占用"; fi
-    local PORT="$new"
+    # The port changes only in this transaction. Status reloads the saved config.
+    # shellcheck disable=SC2030
+    PORT="$new"
   else
     reading '新密码（留空自动生成）: ' new ''
     if [ -z "$new" ]; then new=$(openssl rand -hex 16) || error '生成密码失败'; fi
@@ -744,6 +746,8 @@ do_status() {
   local state=未运行
   require_install
   if detect_init && svc_active; then state=运行中; fi
+  # require_install loads PORT from disk in the current shell.
+  # shellcheck disable=SC2031
   printf '域名: %s\n端口: %s\n内核: %s\n服务: %s\n' "$DOMAIN" "$PORT" "$(core_version)" "$state"
   [ "$state" = 运行中 ]
 }
