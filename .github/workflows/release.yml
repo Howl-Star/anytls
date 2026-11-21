@@ -1,0 +1,26 @@
+name: Release installer
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify and package
+        run: |
+          bash -n anytls.sh
+          shellcheck -x anytls.sh tests/regression.sh
+          bash tests/regression.sh
+          mkdir dist
+          cp anytls.sh dist/anytls.sh
+          (cd dist && sha256sum anytls.sh > SHA256SUMS)
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/anytls.sh dist/SHA256SUMS
