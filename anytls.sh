@@ -203,7 +203,9 @@ start_transaction() {
   local target
   mkdir -p "$WORK_DIR" || error "无法创建 $WORK_DIR"
   [ ! -L "$WORK_DIR" ] || error "无法保护 $WORK_DIR"
-  chmod 700 "$WORK_DIR" || error "无法保护 $WORK_DIR"
+  # 目录必须可穿过，普通用户执行 menu 才能得到“请使用 sudo menu”的提示；
+  # 私钥、配置和凭据文件本身仍是 600，不会因此泄露内容。
+  chmod 755 "$WORK_DIR" || error "无法保护 $WORK_DIR"
   TX=$(mktemp -d "$WORK_DIR/.txn.XXXXXXXX") || error '无法创建事务目录'
   TX_TARGETS=("$@")
   TX_CHANGED=0 TX_COMMITTED=0 TX_WAS_ACTIVE=0 TX_SERVICE_CREATED=0 TX_MENU_CREATED=0 TX_RESTART=0
@@ -475,8 +477,10 @@ restore_acme_conf() {
 }
 
 try_issue() {
-  local rc=0
-  acme --issue --server letsencrypt -d "$DOMAIN" --keylength ec-256 "${ISSUE_ARGS[@]}" "$@" 2>&1 | tee "$TX/acme-issue.log" >&2 || rc=$?
+  local rc
+  # 退出码必须取自 acme.sh 本身；管道取 $? 得到的是 tee 的状态。
+  acme --issue --server letsencrypt -d "$DOMAIN" --keylength ec-256 "${ISSUE_ARGS[@]}" "$@" 2>&1 | tee "$TX/acme-issue.log" >&2
+  rc=${PIPESTATUS[0]}
   [ "$rc" = 0 ] || [ "$rc" = 2 ]
 }
 
@@ -703,6 +707,11 @@ deploy_cert() (
   [ "$DOMAIN" = "$requested" ] || error '续期证书与当前 AnyTLS 域名不一致'
   start_transaction "$KEY_FILE" "$CERT_FILE"
   collect_cert "$(incoming_path "$DOMAIN")"
+  # 内容未变时不替换文件、不重启服务，避免无谓中断现有连接。
+  if cmp -s -- "$TX/cert.pem" "$CERT_FILE" && cmp -s -- "$TX/private.key" "$KEY_FILE"; then
+    info '证书未变化，无需重启'
+    return 0
+  fi
   publish_files "$KEY_FILE" "$CERT_FILE"
   "$BIN_FILE" check -c "$CONF_FILE" || error '续期证书配置校验失败'
   # 保留操作员主动停止的状态。运行中的服务必须通过启动检查。
@@ -815,6 +824,8 @@ do_uninstall() (
 
 do_status() {
   local state=未运行
+  # 配置和证书文件是 root-only；先给出明确的权限提示，避免误报为未安装。
+  need_root
   require_install
   if detect_init && svc_active; then state=运行中; fi
   # require_install loads PORT from disk in the current shell.
