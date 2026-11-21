@@ -28,6 +28,8 @@ expect_error() {
 
 # Legacy .env quoting stays compatible and is parsed literally.
 DOMAIN=tls.example.com PORT=8443 PASSWORD=aabcdef EMAIL='' WEBROOT='/site path'
+# Exercise literal shell syntax in the stored node name.
+# shellcheck disable=SC2016
 NODE_NAME='门店'"'"' $(printf danger) "example"'
 save_env > "$ENV_FILE"
 original_name=$NODE_NAME
@@ -78,7 +80,8 @@ fi
 # Mock service manager. A failed restart must restore the old content and state.
 SVC_EVENTS="$sandbox/service-events"
 svc_active() { return 0; }
-svc_restart() { printf 'restart\n' >> "$SVC_EVENTS"; return 1; }
+restart_rc=1
+svc_restart() { printf 'restart\n' >> "$SVC_EVENTS"; return "$restart_rc"; }
 svc_start() { printf 'start\n' >> "$SVC_EVENTS"; }
 svc_stop() { printf 'stop\n' >> "$SVC_EVENTS"; }
 svc_log() { :; }
@@ -101,7 +104,7 @@ expect_error run_update
 [[ $(cat "$CONF_FILE") == old ]] || fail 'old config was not restored'
 [[ $(cat "$ACME_DOMAIN_CONF") == 'old hook' ]] || fail 'old renewal hook was not restored'
 [[ $(cat "$SVC_EVENTS") == $'restart\nstop\nstart' ]] || fail 'original service was not started again'
-svc_restart() { printf 'restart\n' >> "$SVC_EVENTS"; }
+restart_rc=0
 run_update
 [[ $(cat "$CONF_FILE") == new ]] || fail 'successful restart was not committed'
 [[ $(cat "$ACME_DOMAIN_CONF") == 'new hook' ]] || fail 'new renewal hook was not committed'
@@ -115,6 +118,7 @@ DOMAIN=tls.example.com
 collect_cert "$sandbox/inbox"
 cmp "$TX/cert.pem" "$sandbox/inbox/cert.pem"
 DOMAIN=wrong.example.com
+# shellcheck disable=SC2016
 expect_error bash -c 'source "$1"; TX="$2"; DOMAIN=wrong.example.com; collect_cert "$3"' _ "$script" "$TX" "$sandbox/inbox"
 
 printf 'AnyTLS 回归测试通过\n'
